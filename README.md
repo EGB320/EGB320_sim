@@ -10,7 +10,6 @@ A Python library for controlling autonomous warehouse robots in CoppeliaSim simu
 - [API Documentation](#api-documentation)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
 
 ## Prerequisites
 
