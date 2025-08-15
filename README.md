@@ -26,8 +26,7 @@ Download and install CoppeliaSim from the [official website](https://www.coppeli
 ### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/EGB320/EGB320.github.io.git
-cd EGB320.github.io/VREP_Sim/EGB320_VREP_Files/VREP_PythonCode
+git clone https://github.com/EGB320/EGB320_sim.git
 ```
 
 ### 3. Install Python Dependencies
