@@ -83,7 +83,7 @@ class warehouseObjects(IntEnum):
 	obstacle2 = 8
 	
 	# Picking station objects
-	pickingStation = 9
+	pickingStation = 22
 	pickingStation1 = 19
 	pickingStation2 = 20
 	pickingStation3 = 21
@@ -165,8 +165,8 @@ class COPPELIA_WarehouseRobot(object):
 		self.itemTemplateHandles = [None] * 6
 		self.itemHandles = np.zeros((6,4,3),dtype=np.int16)
 		self.obstacleHandles = [None, None, None]
-		self.packingStationHandle = None
-		self.pickingStationHandles = [None, None, None]
+		self.pickingStationHandle = None
+		self.pickingStationMarkerHandles = [None, None, None]
 		self.pickingStationItemHandles = [None, None, None]
 		self.rowMarkerHandles = [None,None,None]
 		self.shelfHandles = [None]*6
@@ -186,7 +186,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.robotPose = None
 		self.cameraPose = None
 		self.itemPositions = np.full((6,4,3,3),np.nan,dtype=np.float32)
-		self.packingStationPosition = None
+		self.pickingStationPosition = None
 		self.obstaclePositions = [None, None, None]
 		self.rowMarkerPositions = [None, None, None]
 
@@ -299,11 +299,11 @@ class COPPELIA_WarehouseRobot(object):
 		"""
 		# Initialize return variables
 		itemRangeBearing = [None]*6
-		packingStationRangeBearing = None
+		pickingStationRangeBearing = None
 		obstaclesRangeBearing = None
 		rowMarkerRangeBearing = [None,None,None]
 		shelfRangeBearing = [None]*6
-		pickingStationRangeBearing = [None, None, None]
+		pickingStationMarkersRangeBearing = [None, None, None]
 
 		# Default to detecting all objects if none specified
 		if objects is None:
@@ -312,7 +312,7 @@ class COPPELIA_WarehouseRobot(object):
 
 		# Check if camera pose is available
 		if self.cameraPose is None:
-			return itemRangeBearing, packingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationRangeBearing
+			return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
 
 		# Get object detection data from CoppeliaSim vision sensor
 		try:
@@ -360,7 +360,7 @@ class COPPELIA_WarehouseRobot(object):
 					item_type = self.sceneParameters.pickingStationContents[station_index]
 					
 					if item_type != -1 and 0 <= item_type <= 5:
-						station_handle = self.pickingStationHandles[station_index]
+						station_handle = self.pickingStationMarkerHandles[station_index]
 						
 						if station_handle is not None:
 							try:
@@ -386,9 +386,9 @@ class COPPELIA_WarehouseRobot(object):
 
 			# Check for main picking station (index 9)
 			if warehouseObjects.pickingStation in objects:
-				if self.packingStationPosition is not None:
-					packingStationRangeBearing = self._process_single_object_detection(
-						self.packingStationPosition, 9, objectsDetected, self.robotParameters.maxPackingBayDetectionDistance)
+				if self.pickingStationPosition is not None:
+					pickingStationRangeBearing = self._process_single_object_detection(
+						self.pickingStationPosition, 22, objectsDetected, self.robotParameters.maxPickingStationDetectionDistance)
 
 			# Check for row markers (indices 10-12)
 			if warehouseObjects.row_markers in objects:
@@ -399,19 +399,19 @@ class COPPELIA_WarehouseRobot(object):
 			if warehouseObjects.PickingStationMarkers in objects:
 				for station_index in range(3):
 					if self._is_object_detected(objectsDetected, 19 + station_index):
-						station_handle = self.pickingStationHandles[station_index]
+						station_handle = self.pickingStationMarkerHandles[station_index]
 						if station_handle is not None:
 							try:
 								station_position = self.sim.getObjectPosition(station_handle, -1)
 								result = self._process_single_object_detection(
 									station_position, 19 + station_index, objectsDetected, 
-									self.robotParameters.maxPackingBayDetectionDistance)
+									self.robotParameters.maxPickingStationMarkersDetectionDistance)
 								if result is not None:
-									pickingStationRangeBearing[station_index] = result
+									pickingStationMarkersRangeBearing[station_index] = result
 							except Exception:
 								pass
 
-		return itemRangeBearing, packingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationRangeBearing
+		return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
 
 
 	def GetCameraImage(self):
@@ -942,16 +942,16 @@ class COPPELIA_WarehouseRobot(object):
 	# Get ZMQ Picking Station Handles
 	def GetPickingStationHandle(self):
 		try:
-			self.packingStationHandle = self.sim.getObject('/Picking_station')
+			self.pickingStationHandle = self.sim.getObject('/Picking_station')
 			
 			# Try to get multiple picking station handles
 			for i in range(3):
 				try:
 					station_name = f'/Picking_station_{i+1}'
-					self.pickingStationHandles[i] = self.sim.getObject(station_name)
+					self.pickingStationMarkerHandles[i] = self.sim.getObject(station_name)
 				except Exception:
 					# If specific picking station doesn't exist, keep as None
-					self.pickingStationHandles[i] = None
+					self.pickingStationMarkerHandles[i] = None
 			
 			return 0
 		except Exception as e:
@@ -1113,7 +1113,7 @@ class COPPELIA_WarehouseRobot(object):
 			item_type = self.sceneParameters.pickingStationContents[station_index]
 			
 			if item_type != -1 and 0 <= item_type <= 5:  # Valid item type
-				station_handle = self.pickingStationHandles[station_index]
+				station_handle = self.pickingStationMarkerHandles[station_index]
 				
 				if station_handle is not None:
 					try:
@@ -1269,7 +1269,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.robotPose = None
 		self.cameraPose = None
 		# self.itemPositions = [None]*len(self.itemHandles)
-		self.packingStationPosition = None
+		self.pickingStationPosition = None
 		self.obstaclePositions = [None, None, None]
 
 		# GET 2D ROBOT POSE
@@ -1299,8 +1299,8 @@ class COPPELIA_WarehouseRobot(object):
 
 		# packingBay position
 		try:
-			packingStationPosition = self.sim.getObjectPosition(self.packingStationHandle, -1)
-			self.packingStationPosition = packingStationPosition
+			pickingStationPosition = self.sim.getObjectPosition(self.pickingStationHandle, -1)
+			self.pickingStationPosition = pickingStationPosition
 		except Exception as e:
 			print(f"Error getting picking station position: {e}")
 
@@ -1681,7 +1681,8 @@ class RobotParameters(object):
 		
 		# Detection Parameters
 		self.maxItemDetectionDistance = 1.0      # max distance to detect items in m
-		self.maxPackingBayDetectionDistance = 2.5  # max distance to detect packing bay in m
+		self.maxPickingStationDetectionDistance = 2.5  # max distance to detect picking station in m
+		self.maxPickingStationMarkersDetectionDistance = 2.5  # max distance to detect picking station markers in m
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m
 		self.maxRowMarkerDetectionDistance = 2.5  # max distance to detect row markers in m
 		self.maxShelfDetectionDistance = 2.0     # max distance to detect shelves in m

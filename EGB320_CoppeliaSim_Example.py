@@ -70,7 +70,8 @@ robotParameters.cameraTilt = 0.0                  # Camera tilt angle (radians)
 
 # Object detection ranges (in meters)
 robotParameters.maxItemDetectionDistance = 1.0         # Items
-robotParameters.maxPackingBayDetectionDistance = 2.5   # Picking stations
+robotParameters.maxPickingStationDetectionDistance = 2.5   # Picking stations
+robotParameters.maxPickingStationMarkersDetectionDistance = 2.5  # Picking station markers
 robotParameters.maxObstacleDetectionDistance = 1.5     # Obstacles
 robotParameters.maxRowMarkerDetectionDistance = 2.5    # Row markers
 
@@ -119,10 +120,11 @@ if __name__ == '__main__':
 			])
 
 			# Unpack the detection results
-			itemsRB, packingStationRB, obstaclesRB, rowMarkerRB, shelfRB, pickingStationRB = objectsRB
+			itemsRB, pickingStationRB, obstaclesRB, rowMarkerRB, shelfRB, pickingStationMarkersRB = objectsRB
 
 			# Optional: Get camera image for computer vision processing
-			# resolution, image_data = warehouseBotSim.GetCameraImage()
+			# This will slow down the sim
+			#resolution, image_data = warehouseBotSim.GetCameraImage()
 
 			# Clear screen and show current status
 			if show_debug_info:
@@ -132,11 +134,11 @@ if __name__ == '__main__':
 				
 				# Display detected objects
 				print_debug_range_bearing("Items", itemsRB)
-				print_debug_range_bearing("Packing Station", packingStationRB)
 				print_debug_range_bearing("Obstacles", obstaclesRB)
 				print_debug_range_bearing("Row Markers", rowMarkerRB)
 				print_debug_range_bearing("Shelves", shelfRB)
-				print_debug_range_bearing("Picking Stations", pickingStationRB)
+				print_debug_range_bearing("Picking Station", pickingStationRB)
+				print_debug_range_bearing("Picking Stations", pickingStationMarkersRB)
 				print("=" * 50)
 
 			# Update object positions (required for accurate detection)
