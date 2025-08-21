@@ -10,7 +10,6 @@ A Python library for controlling autonomous warehouse robots in CoppeliaSim simu
 - [API Documentation](#api-documentation)
 - [Examples](#examples)
 - [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
 
 ## Prerequisites
 
@@ -27,8 +26,7 @@ Download and install CoppeliaSim from the [official website](https://www.coppeli
 ### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/EGB320/EGB320.github.io.git
-cd EGB320.github.io/VREP_Sim/EGB320_VREP_Files/VREP_PythonCode
+git clone https://github.com/EGB320/EGB320_sim.git
 ```
 
 ### 3. Install Python Dependencies
@@ -227,24 +225,6 @@ if image_data is not None:
 
 ---
 
-#### `GetDetectedWallPoints()`
-
-Gets range and bearing to wall points visible in the camera's field of view.
-
-**Returns:**
-- `list`: List of [range, bearing] arrays for visible wall points, or None if no walls detected
-
-**Example:**
-```python
-wall_points = robot.GetDetectedWallPoints()
-if wall_points:
-    for point in wall_points:
-        range_m, bearing_rad = point
-        print(f"Wall point at {range_m:.2f}m, {math.degrees(bearing_rad):.1f}°")
-```
-
----
-
 ### Item Collection and Delivery
 
 #### `CollectItem(closest_picking_station=False)`
@@ -267,6 +247,20 @@ if success:
     print(f"Collected item from station {station}")
 else:
     print("Failed to collect item")
+```
+
+---
+#### `DropItem()`
+
+Drops the currently held item at the robot's current location.
+
+**Returns:** None
+
+**Example:**
+```python
+if robot.itemCollected():
+    robot.DropItem()
+    print("Item dropped")
 ```
 
 ---
@@ -311,21 +305,6 @@ if robot.itemCollected():
     print("Robot is carrying an item")
     # Try to drop it at a shelf
     robot.DropItemInClosestShelfBay()
-```
-
----
-
-#### `DropItem()`
-
-Drops the currently held item at the robot's current location.
-
-**Returns:** None
-
-**Example:**
-```python
-if robot.itemCollected():
-    robot.DropItem()
-    print("Item dropped")
 ```
 
 ---
@@ -449,44 +428,8 @@ except KeyboardInterrupt:
     robot.StopSimulator()
 ```
 
-### Example 2: Item Collection and Delivery
-
-```python
-from warehousebot_lib import *
-import time
-
-# Setup
-robotParameters = RobotParameters()
-sceneParameters = SceneParameters()
-sceneParameters.pickingStationContents[0] = warehouseObjects.bowl
-robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
-robot.StartSimulator()
-
-try:
-    while True:
-        robot.UpdateObjectPositions()
-        
-        if not robot.itemCollected():
-            # Try to collect items
-            success, station = robot.CollectItem(closest_picking_station=True)
-            if success:
-                print(f"Collected item from station {station}")
-        else:
-            # Try to deliver item
-            success, shelf_info = robot.DropItemInClosestShelfBay()
-            if success:
-                print(f"Delivered item to shelf {shelf_info['shelf']}")
-            else:
-                # Navigate to find a shelf
-                robot.SetTargetVelocities(0.1, 0.1)
-        
-        time.sleep(0.1)
-        
-except KeyboardInterrupt:
-    robot.StopSimulator()
-```
-
-### Example 3: Computer Vision Processing
+### Example 2: Computer Vision Processing
+### Not Necceassary for Navigation
 
 ```python
 from warehousebot_lib import *
@@ -531,18 +474,17 @@ except KeyboardInterrupt:
 **Problem:** "Failed to connect to CoppeliaSim"
 - **Solution:** Ensure CoppeliaSim is running and the correct scene is loaded
 - **Check:** Verify ZMQ Remote API is enabled in CoppeliaSim
-- **Port:** Default port is 23000, make sure it's not blocked
 
 **Problem:** "Port 23000 connection failed"
 - **Solution:** Check if another program is using the port
-- **Alternative:** Try a different port number in the constructor
+- **Alternative:** Check which port number coppeliaSim is using as it may have changed from the default
 
 ### Detection Issues
 
 **Problem:** No objects detected
 - **Solution:** Always call `UpdateObjectPositions()` in your main loop
 - **Check:** Verify objects are within detection ranges
-- **Debug:** Use `GetCameraImage()` to verify camera is working
+- **Debug:** Use `GetCameraImage()` to verify camera is working and camera position is correct
 
 **Problem:** Objects detected incorrectly
 - **Solution:** Check robot parameter detection distances
@@ -557,25 +499,17 @@ except KeyboardInterrupt:
 
 **Problem:** Robot moving erratically
 - **Solution:** Reduce maximum speed parameters
-- **Adjust:** Increase `driveSystemQuality` value
 - **Check:** Ensure `UpdateObjectPositions()` is called regularly
 
 ### Installation Issues
 
 **Problem:** "No module named 'coppeliasim_zmqremoteapi_client'"
 - **Solution:** Install using pip: `pip install coppeliasim-zmqremoteapi-client`
-- **Alternative:** Check if you're using the correct Python environment
+- **Alternative:** Try `python3 -m pip install coppeliasim-zmqremoteapi-client`
 
 **Problem:** ImportError with other dependencies
 - **Solution:** Install all required packages: `pip install opencv-python pygame numpy`
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## License
 
