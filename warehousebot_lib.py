@@ -7,24 +7,30 @@ import sys
 from enum import IntEnum
 
 """
-EGB320 Warehouse Robot Library
+EGB320 Search and Rescue Robot Library (2026)
 
-This library provides a Python interface for controlling a warehouse robot in CoppeliaSim.
+This library provides a Python interface for controlling the EGB320 robot in CoppeliaSim.
+
+As of this phase, the library targets the 2026 search and rescue maze challenge. It uses
+the CoppeliaSim ZeroMQ Python remote API to deterministically generate a 7x7 cell maze
+(walls, corner posts) and place three victim objects. The legacy 2025 warehouse pick and
+place functions (picking stations, shelves, items, obstacles, row markers) are retained for
+backward compatibility but are optional and are not required for this phase.
 
 MAIN FUNCTIONS:
 ===========================
 
 Robot Control:
-- StartSimulator() / StopSimulator()    : Start/stop the simulation
+- StartSimulator() / StopSimulator()    : Start/stop the simulation (generates the maze while stopped)
 - SetTargetVelocities(x_dot, theta_dot) : Set robot movement velocities
 - UpdateObjectPositions()               : Update object positions (call this every loop!)
 
 Object Detection:
-- GetDetectedObjects(objects)           : Get range/bearing to all detected objects  
+- GetDetectedObjects(objects)           : Get range/bearing to all detected objects (legacy warehouse objects)
 - GetCameraImage()                      : Get camera image for computer vision
 - GetDetectedWallPoints()               : Get range/bearing to visible walls
 
-Item Collection:
+Legacy Item Collection (2025 warehouse challenge, unused in this phase):
 - CollectItem(closest_picking_station)  : Collect items from picking stations
 - DropItemInClosestShelfBay()          : Drop items in nearest empty shelf bay
 - itemCollected()                       : Check if robot is carrying an item
@@ -37,32 +43,84 @@ EXAMPLE USAGE:
 =============
 # Initialize robot
 robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
-robot.StartSimulator()
+robot.StartSimulator()  # generates the maze, then starts the simulation
 
 # Main control loop
 while True:
     # Move robot
     robot.SetTargetVelocities(0.1, 0.0)  # Move forward at 0.1 m/s
     
-    # Get object detections
-    objects = robot.GetDetectedObjects([warehouseObjects.items, warehouseObjects.obstacles])
-    items, _, obstacles, _, _, _ = objects
-    
     # Update positions (important!)
     robot.UpdateObjectPositions()
-    
-    # Collect items if nearby
-    success, station = robot.CollectItem(closest_picking_station=True)
-    
-    # Drop items at shelves
-    if robot.itemCollected():
-        robot.DropItemInClosestShelfBay()
 
 For more examples, see EGB320_CoppeliaSim_Example.py
 """
 
 
+# Deterministic example maze layout (Phase 1): internal wall segments between grid
+# intersections. Each entry is ((startColumn, startRow), (endColumn, endRow)) using the
+# grid intersection convention described in SetScene/_grid_point_to_world. Intentionally
+# not merged/optimised - this should always produce exactly 40 internal wall copies.
+EXAMPLE_MAZE_SEGMENTS = [
+	((4, 0), (4, 1)),
 
+	((1, 1), (2, 1)),
+	((2, 1), (2, 2)),
+
+	((3, 1), (3, 2)),
+	((3, 2), (3, 3)),
+	((3, 1), (4, 2)),
+	((4, 2), (5, 1)),
+
+	((5, 1), (6, 1)),
+	((6, 1), (6, 2)),
+	((6, 2), (6, 3)),
+
+	((5, 1), (5, 2)),
+	((5, 2), (5, 3)),
+	((5, 3), (5, 4)),
+
+	((0, 2), (1, 2)),
+	((1, 2), (2, 2)),
+
+	((3, 2), (4, 2)),
+	((4, 2), (5, 2)),
+
+	((1, 3), (1, 4)),
+
+	((2, 3), (3, 3)),
+	((2, 3), (2, 4)),
+	((2, 4), (2, 5)),
+	((2, 5), (2, 6)),
+	((2, 4), (3, 3)),
+
+	((3, 4), (4, 3)),
+
+	((1, 4), (2, 4)),
+
+	((3, 4), (4, 4)),
+	((4, 4), (5, 4)),
+
+	((6, 4), (7, 4)),
+
+	((3, 4), (3, 5)),
+
+	((1, 5), (1, 6)),
+	((1, 6), (1, 7)),
+
+	((4, 5), (4, 6)),
+
+	((5, 4), (5, 5)),
+	((5, 5), (5, 6)),
+	((5, 5), (6, 5)),
+
+	((4, 6), (5, 6)),
+	((5, 6), (6, 6)),
+
+	((1, 6), (2, 7)),
+	((2, 7), (3, 6)),
+	((3, 6), (3, 7)),
+]
 
 
 
@@ -173,6 +231,34 @@ class COPPELIA_WarehouseRobot(object):
 		self.bayHandles = np.full((6,4,3), None, dtype=object)
 		self.proximityHandle = None
 
+		# Search and rescue maze scene object handles (essential for this phase)
+		self.floorHandle = None
+		self.tableWallHandles = []
+		self.mazeWallTemplateHandle = None
+		self.wallPostTemplateHandle = None
+		self.victimTemplateHandle = None
+
+		# Generated maze object bookkeeping (used for cleanup on regeneration)
+		self.generatedSceneRootHandle = None
+		self.generatedMazeWallHandles = []
+		self.generatedWallPostHandles = []
+		self.victimHandles = {}
+		self.victimPositions = {}
+
+		# Cached maze geometry (populated by _get_floor_info/_cache_template_geometry)
+		self.floorCenter = None
+		self.floorTopZ = None
+		self.mazeXMinimum = None
+		self.mazeYMaximum = None
+		self.mazeWallTemplateSize = None
+		self.wallPostTemplateSize = None
+		self.wallPostTemplateOrientation = None
+		self.victimTemplateSize = None
+		self.victimTemplateOrientation = None
+
+		# Optional objects that could not be resolved during handle lookup (diagnostics only)
+		self.missingOptionalObjects = []
+
 		# Wheel bias simulation for imperfect drive systems
 		if self.robotParameters.driveSystemQuality != 1:
 			self.leftWheelBias = np.random.normal(0, (1-self.robotParameters.driveSystemQuality)*0.2, 1)
@@ -201,6 +287,8 @@ class COPPELIA_WarehouseRobot(object):
 		# Get object handles from the simulation
 		print("Getting simulation object handles...")
 		self.GetCOPPELIAObjectHandles()
+		if self.missingOptionalObjects:
+			print(f"Optional objects not found (safe to ignore for this phase): {', '.join(self.missingOptionalObjects)}")
 
 		# Configure robot parameters
 		print("Configuring robot parameters...")
@@ -217,24 +305,39 @@ class COPPELIA_WarehouseRobot(object):
 		"""
 		Starts the CoppeliaSim simulation.
 		Can also be started manually by pressing the Play button in CoppeliaSim.
+
+		The maze (posts, walls, victims) is generated deterministically while the
+		simulation is stopped, so that starting/stopping/starting again never leaves
+		duplicate generated objects in the scene.
 		"""
 		print('Starting CoppeliaSim simulation...')
-		
+
 		try:
+			simState = self.sim.getSimulationState()
+			if simState != self.sim.simulation_stopped:
+				print('Simulation is currently running - stopping it to (re)generate the scene deterministically...')
+				self.sim.stopSimulation()
+				while self.sim.getSimulationState() != self.sim.simulation_stopped:
+					time.sleep(0.05)
+				print('Simulation stopped.')
+
 			if self.robotParameters.sync:
 				print('Setting synchronous mode (may cause issues - consider setting sync=False)')
 				self.sim.setStepping(True)
-			
+		except Exception as e:
+			print(f'Error checking/stopping simulation state: {e}')
+
+		print('Preparing static scene (maze generation) while simulation is stopped...')
+		self.SetScene()
+
+		try:
 			self.sim.startSimulation()
 			print('CoppeliaSim simulation started successfully.')
 		except Exception as e:
 			print(f'Error starting simulation: {e}')
 			print('Try starting the simulation manually by pressing Play in CoppeliaSim.')
 			sys.exit(-1)
-		
-		print('Setting up scene...')
-		self.SetScene()
-		
+
 		time.sleep(1)
 		self.GetObjectPositions()
 
@@ -790,9 +893,56 @@ class COPPELIA_WarehouseRobot(object):
 			print('3. Check that ZMQ Remote API is enabled')
 			sys.exit(-1)
 
+	def _try_get_object(self, path):
+		"""Attempt to resolve a scene object path without raising. Returns the handle, or None if not found."""
+		try:
+			handle = self.sim.getObject(path, {'noError': True})
+		except TypeError:
+			# Installed API version may not support the {'noError': True} options argument
+			try:
+				handle = self.sim.getObject(path)
+			except Exception:
+				return None
+		except Exception:
+			return None
+		if handle is None or handle == -1:
+			return None
+		return handle
+
+	def _resolve_first_available(self, candidatePaths, label, required=True, verbose=True):
+		"""
+		Try a list of candidate object paths and return the handle of the first one that resolves.
+		Logs which path was used, so differences between scene layouts are easy to diagnose.
+		Missing optional objects are recorded in self.missingOptionalObjects for the startup summary.
+		"""
+		for path in candidatePaths:
+			handle = self._try_get_object(path)
+			if handle is not None:
+				if verbose:
+					print(f"Resolved {label} -> '{path}' (handle {handle})")
+				return handle
+		if required:
+			if verbose:
+				print(f"Error: could not resolve required object '{label}'. Tried: {candidatePaths}")
+		else:
+			if verbose:
+				print(f"Note: optional object '{label}' not found. Tried: {candidatePaths}")
+			self.missingOptionalObjects.append(label)
+		return None
+
 	def GetCOPPELIAObjectHandles(self):
-		"""Get handles to all objects in the CoppeliaSim scene."""
-		# Get essential object handles
+		"""
+		Resolve object handles needed for the search and rescue maze scene.
+
+		Only the robot, drive motors, floor, table boundary walls, and the maze/post/victim
+		templates are required in this phase - startup aborts if any of these are missing.
+		Robot sensors (vision sensor, object detector, proximity sensor, collector force
+		sensor, rear motors) are optional and resolved best-effort using candidate paths that
+		cover both the new and legacy scene layouts. Legacy 2025 warehouse objects (picking
+		stations, obstacles, row markers, shelves, item templates) are resolved best-effort
+		only and never abort startup if missing.
+		"""
+		# --- Essential: robot + drive motors ---
 		errorCode = self.GetRobotHandle()
 		if errorCode != 0:
 			print('Failed to get Robot object handle.')
@@ -803,65 +953,43 @@ class COPPELIA_WarehouseRobot(object):
 			print('Failed to get Script handle.')
 			sys.exit(-1)
 
-		errorCode = self.GetCameraHandle()
-		if errorCode != 0:
-			print('Failed to get Camera handle.')
-			sys.exit(-1)
-
-		errorCode = self.GetObjectDetectorHandle()
-		if errorCode != 0:
-			print('Failed to get Object Detector handle.')
-			sys.exit(-1)
-
-		errorCode = self.GetCollectorForceSensorHandle()
-		if errorCode != 0:
-			print('Failed to get Collector Force Sensor handle.')
-			sys.exit(-1)
-
-		# Get motor handles
 		errorCode1, errorCode2, errorCode3, errorCode4 = self.GetMotorHandles()
 		if errorCode1 != 0 or errorCode2 != 0:
-			print('Failed to get Motor handles.')
+			print('Failed to get drive Motor handles.')
 			sys.exit(-1)
 		elif errorCode3 != 0 or errorCode4 != 0:
-			print("Warning: Could not get rear wheel motors (normal for some robot models)")
+			print("Note: rear wheel motors not found (fine for two-wheel differential robots).")
 
-		# Get scene object handles
-		packingStationErrorCode = self.GetPickingStationHandle()
-		if packingStationErrorCode != 0:
-			print('Failed to get picking station handles.')
-			sys.exit(-1)
-
-		errorCode1, errorCode2, errorCode3 = self.GetObstacleHandles()
-		if errorCode1 != 0 or errorCode2 != 0 or errorCode3 != 0:
-			print('Failed to get obstacle handles.')
+		# --- Essential: search and rescue maze scene objects ---
+		self.floorHandle = self._resolve_first_available(['/floor'], 'floor', required=True)
+		if self.floorHandle is None:
 			sys.exit(-1)
 
-		errorCode1, errorCode2, errorCode3 = self.GetRowMarkerHandles()
-		if errorCode1 != 0 or errorCode2 != 0 or errorCode3 != 0:
-			print('Failed to get row marker handles.')
+		self.tableWallHandles = []
+		for i in range(4):
+			handle = self._resolve_first_available([f'/table_wall[{i}]'], f'table_wall[{i}]', required=True)
+			if handle is None:
+				sys.exit(-1)
+			self.tableWallHandles.append(handle)
+
+		self.mazeWallTemplateHandle = self._resolve_first_available(['/maze_wall'], 'maze_wall template', required=True)
+		self.wallPostTemplateHandle = self._resolve_first_available(['/wall_post'], 'wall_post template', required=True)
+		self.victimTemplateHandle = self._resolve_first_available(['/victim'], 'victim template', required=True)
+		if self.mazeWallTemplateHandle is None or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
 			sys.exit(-1)
-		
-		errorCodes = self.GetItemTemplateHandles()
-		if any([code != 0 for code in errorCodes]):
-			print('Failed to get item template handles.')
-			sys.exit(-1)
-			
-		errorCodes = self.getShelfHandles()
-		if any([code != 0 for code in errorCodes]):
-			print('Failed to get shelf handles.')
-			sys.exit(-1)
-	
-		errorCode = self.getProximityhandle()
-		if errorCode != 0:
-			print('Failed to get proximity sensor handle.')
-			sys.exit(-1)
-		
-		errorCodes = self.getBayHandles()
-		if any([code != 0 for code in errorCodes]):
-			print('Failed to get bay handles.')
-			sys.exit(-1)
-	
+
+		# --- Optional: robot sensors (candidate paths cover both the new and legacy scene layouts) ---
+		self.GetCollectorForceSensorHandle()
+		self.GetCameraHandle()
+		self.GetObjectDetectorHandle()
+		self.getProximityhandle()
+
+		# --- Legacy (2025 warehouse challenge) objects: best-effort only, never abort startup ---
+		# Picking stations, item templates, row markers and shelves/bays no longer exist in the
+		# search and rescue maze scene, so they are not resolved here. Obstacles are kept since
+		# they may still be used (e.g. for future rubble/hazard objects).
+		self.GetObstacleHandles()
+
 	############################################
 	####### COPPELIA OBJECT HANDLE FUNCTIONS #######
 	############################################
@@ -869,178 +997,179 @@ class COPPELIA_WarehouseRobot(object):
 
 	# Get COPPELIA Robot Handle
 	def GetRobotHandle(self):
-		try:
-			self.robotHandle = self.sim.getObject('/Robot')
-			return 0
-		except Exception as e:
-			print(f"Error getting robot handle: {e}")
+		handle = self._try_get_object('/Robot')
+		if handle is None:
+			print("Error getting robot handle: '/Robot' not found")
 			return -1
+		self.robotHandle = handle
+		return 0
 
 	# Get Script Handle (attached to Robot object)
 	def GetScriptHandle(self):
-		try:
-			# Try common script paths - the script is usually attached as a child script to the Robot
-			self.scriptHandle = self.sim.getObject('/Robot')  # Use robot handle for script calls
-			return 0
-		except Exception as e:
-			print(f"Error getting script handle: {e}")
-			return -1
+		# The robot handle doubles as the script handle for callScriptFunction calls
+		self.scriptHandle = self.robotHandle
+		return 0 if self.scriptHandle is not None else -1
 
-	# Get ZMQ Camera Handle
+	# Get ZMQ Camera Handle (the robot's onboard vision sensor - NOT the external /camera overview camera)
 	def GetCameraHandle(self):
-		try:
-			self.cameraHandle = self.sim.getObject('/VisionSensor')
-			return 0
-		except Exception as e:
-			print(f"Error getting camera handle: {e}")
-			return -1
+		self.cameraHandle = self._resolve_first_available(
+			['/Robot/VisionSensor', '/VisionSensor'], 'robot VisionSensor', required=False)
+		return 0 if self.cameraHandle is not None else -1
 
 	# Get ZMQ Object Detector Handle
 	def GetObjectDetectorHandle(self):
-		try:
-			self.objectDetectorHandle = self.sim.getObject('/Robot/ObjectDetector')
-			return 0
-		except Exception as e:
-			print(f"Error getting object detector handle: {e}")
-			return -1
+		self.objectDetectorHandle = self._resolve_first_available(
+			['/Robot/VisionSensor/ObjectDetector', '/Robot/ObjectDetector'], 'ObjectDetector', required=False)
+		return 0 if self.objectDetectorHandle is not None else -1
 
 	# Get ZMQ CollectorForceSensor Handle
 	def GetCollectorForceSensorHandle(self):
-		try:
-			self.collectorForceSensorHandle = self.sim.getObject('/Robot/CollectorForceSensor')
-			return 0
-		except Exception as e:
-			print(f"Error getting collector force sensor handle: {e}")
-			return -1
+		self.collectorForceSensorHandle = self._resolve_first_available(
+			['/Robot/CollectorForceSensor'], 'CollectorForceSensor', required=False)
+		return 0 if self.collectorForceSensorHandle is not None else -1
 
 			
 	# Get COPPELIA Motor Handles
 	# Get ZMQ Motor Handles
 	def GetMotorHandles(self):
+		"""Resolve drive motor handles. Left/right motors are required; rear motors are optional (4-wheel robots only)."""
 		errorCode1 = 0
 		errorCode2 = 0
 		errorCode3 = 0
 		errorCode4 = 0
 
-		try:
-			if self.robotParameters.driveType == 'differential':
-				self.leftMotorHandle = self.sim.getObject('/LeftMotor')
-				self.rightMotorHandle = self.sim.getObject('/RightMotor')
-				try:
-					self.leftRearMotorHandle = self.sim.getObject('/LeftRearMotor')
-					self.rightRearMotorHandle = self.sim.getObject('/RightRearMotor')
-				except:
-					# Some robots may not have rear motors
-					self.leftRearMotorHandle = None
-					self.rightRearMotorHandle = None
-		except Exception as e:
-			print(f"Error getting motor handles: {e}")
-			errorCode1 = -1
-		
+		if self.robotParameters.driveType == 'differential':
+			self.leftMotorHandle = self._try_get_object('/LeftMotor')
+			if self.leftMotorHandle is None:
+				print("Error getting left motor handle")
+				errorCode1 = -1
+
+			self.rightMotorHandle = self._try_get_object('/RightMotor')
+			if self.rightMotorHandle is None:
+				print("Error getting right motor handle")
+				errorCode2 = -1
+
+			self.leftRearMotorHandle = self._try_get_object('/LeftRearMotor')
+			if self.leftRearMotorHandle is None:
+				errorCode3 = -1
+
+			self.rightRearMotorHandle = self._try_get_object('/RightRearMotor')
+			if self.rightRearMotorHandle is None:
+				errorCode4 = -1
+
 		return errorCode1, errorCode2, errorCode3, errorCode4
 
-	# Get ZMQ Picking Station Handles
+	# Get ZMQ Picking Station Handles (legacy 2025 warehouse challenge; not used in this phase)
 	def GetPickingStationHandle(self):
-		try:
-			self.pickingStationHandle = self.sim.getObject('/Picking_station')
-			
-			# Try to get multiple picking station handles
-			for i in range(3):
-				try:
-					station_name = f'/Picking_station_{i+1}'
-					self.pickingStationMarkerHandles[i] = self.sim.getObject(station_name)
-				except Exception:
-					# If specific picking station doesn't exist, keep as None
-					self.pickingStationMarkerHandles[i] = None
-			
-			return 0
-		except Exception as e:
-			print(f"Error getting picking station handle: {e}")
-			return -1
+		"""Best-effort resolution of legacy picking station handles. Missing objects are expected in this phase."""
+		missing = []
 
-	# Get ZMQ item Template Handles
+		self.pickingStationHandle = self._try_get_object('/Picking_station')
+		if self.pickingStationHandle is None:
+			missing.append('/Picking_station')
+
+		for i in range(3):
+			path = f'/Picking_station_{i+1}'
+			handle = self._try_get_object(path)
+			self.pickingStationMarkerHandles[i] = handle
+			if handle is None:
+				missing.append(path)
+
+		if missing:
+			print(f"Legacy picking station objects not found (expected in this phase): {', '.join(missing)}")
+		return 0
+
+	# Get ZMQ item Template Handles (legacy 2025 warehouse challenge; not used in this phase)
 	def GetItemTemplateHandles(self):
+		"""Best-effort resolution of legacy warehouse item templates. Missing objects are expected in this phase."""
 		error_codes = []
+		missing = []
 		for index, name in enumerate(["BOWL","MUG","BOTTLE","SOCCER_BALL","RUBIKS_CUBE","CEREAL_BOX"]):
-			try:
-				handle = self.sim.getObject(f'/{name}')
+			handle = self._try_get_object(f'/{name}')
+			self.itemTemplateHandles[index] = handle
+			if handle is not None:
 				error_codes.append(0)
-				self.itemTemplateHandles[index] = handle
-			except Exception as e:
-				print(f"Error getting item template handle for {name}: {e}")
+			else:
 				error_codes.append(-1)
-			
+				missing.append(name)
+		if missing:
+			print(f"Legacy item templates not found (expected in this phase): {', '.join(missing)}")
 		return error_codes
 
-	# Get ZMQ Obstacle Handles
+	# Get ZMQ Obstacle Handles (legacy 2025 warehouse challenge; not used in this phase)
 	def GetObstacleHandles(self):
+		"""Best-effort resolution of legacy obstacle handles. Missing objects are expected in this phase."""
 		error_codes = [0, 0, 0]
-		try:
-			self.obstacleHandles[0] = self.sim.getObject('/Obstacle_0')
-		except:
-			error_codes[0] = -1
-		try:
-			self.obstacleHandles[1] = self.sim.getObject('/Obstacle_1')
-		except:
-			error_codes[1] = -1
-		try:
-			self.obstacleHandles[2] = self.sim.getObject('/Obstacle_2')
-		except:
-			error_codes[2] = -1
+		missing = []
+		for index in range(3):
+			path = f'/Obstacle_{index}'
+			handle = self._try_get_object(path)
+			self.obstacleHandles[index] = handle
+			if handle is None:
+				error_codes[index] = -1
+				missing.append(path)
+		if missing:
+			print(f"Legacy obstacles not found (expected in this phase): {', '.join(missing)}")
 		return tuple(error_codes)
 	
-	# Get ZMQ Row marker handles
+	# Get ZMQ Row marker handles (legacy 2025 warehouse challenge; not used in this phase)
 	def GetRowMarkerHandles(self):
+		"""Best-effort resolution of legacy row marker handles. Missing objects are expected in this phase."""
 		error_codes = [0, 0, 0]
-		try:
-			self.rowMarkerHandles[0] = self.sim.getObject('/row_marker1')
-		except:
-			error_codes[0] = -1
-		try:
-			self.rowMarkerHandles[1] = self.sim.getObject('/row_marker2')
-		except:
-			error_codes[1] = -1
-		try:
-			self.rowMarkerHandles[2] = self.sim.getObject('/row_marker3')
-		except:
-			error_codes[2] = -1
+		missing = []
+		for i in range(3):
+			path = f'/row_marker{i+1}'
+			handle = self._try_get_object(path)
+			self.rowMarkerHandles[i] = handle
+			if handle is None:
+				error_codes[i] = -1
+				missing.append(path)
+		if missing:
+			print(f"Legacy row markers not found (expected in this phase): {', '.join(missing)}")
 		return tuple(error_codes)
 
 
-	# Get ZMQ shelf handles
+	# Get ZMQ shelf handles (legacy 2025 warehouse challenge; not used in this phase)
 	def getShelfHandles(self):
+		"""Best-effort resolution of legacy shelf handles. Missing objects are expected in this phase."""
 		errorCodes = [0]*6
+		missing = []
 		for i in range(6):
-			try:
-				self.shelfHandles[i] = self.sim.getObject(f'/Shelf{i}')
-			except:
+			path = f'/Shelf{i}'
+			handle = self._try_get_object(path)
+			self.shelfHandles[i] = handle
+			if handle is None:
 				errorCodes[i] = -1
+				missing.append(path)
+		if missing:
+			print(f"Legacy shelves not found (expected in this phase): {', '.join(missing)}")
 		return tuple(errorCodes)
 
 	# Get ZMQ proximity sensor handle.
 	def getProximityhandle(self):
-		try:
-			self.proximityHandle = self.sim.getObject('/Proximity_sensor')
-			return 0
-		except Exception as e:
-			print(f"Error getting proximity sensor handle: {e}")
-			return -1
+		self.proximityHandle = self._resolve_first_available(
+			['/Robot/VisionSensor/Proximity_sensor', '/Proximity_sensor'], 'Proximity_sensor', required=False)
+		return 0 if self.proximityHandle is not None else -1
 
-	# Get ZMQ bay handles for each shelf
+	# Get ZMQ bay handles for each shelf (legacy 2025 warehouse challenge; not used in this phase)
 	def getBayHandles(self):
+		"""Best-effort resolution of legacy shelf bay handles. Missing objects are expected in this phase."""
 		error_codes = []
+		foundCount = 0
+		totalCount = 0
 		for shelf in range(6):  # 6 shelves (0-5)
 			for x in range(4):  # 4 x positions (0-3)
 				for y in range(3):  # 3 y positions/heights (0-2)
-					try:
-						# Bay naming convention: /Shelf{shelf}/Bay{x}{y}
-						bay_name = '/Shelf%d/Bay%d%d' % (shelf, x, y)
-						self.bayHandles[shelf, x, y] = self.sim.getObject(bay_name)
+					totalCount += 1
+					bay_name = '/Shelf%d/Bay%d%d' % (shelf, x, y)
+					handle = self._try_get_object(bay_name)
+					self.bayHandles[shelf, x, y] = handle
+					if handle is not None:
+						foundCount += 1
 						error_codes.append(0)
-					except Exception as e:
-						print("Warning: Could not get handle for %s: %s" % (bay_name, str(e)))
-						self.bayHandles[shelf, x, y] = None
+					else:
 						error_codes.append(-1)
+		print(f"Legacy shelf bays found: {foundCount}/{totalCount} (expected 0 in this phase)")
 		return error_codes
 	
 	###############################################
@@ -1050,60 +1179,463 @@ class COPPELIA_WarehouseRobot(object):
 
 	# Updates the robot within COPPELIA based on the robot paramters
 	def UpdateCOPPELIARobot(self):
-		# Set Camera Pose and Orientation
+		# Set Camera Pose and Orientation (skipped if no VisionSensor was resolved)
+		if self.cameraHandle is None:
+			print("Note: skipping camera pose/orientation setup - no VisionSensor resolved.")
+			return
 		self.SetCameraPose(self.robotParameters.cameraDistanceFromRobotCenter, self.robotParameters.cameraHeightFromFloor, self.robotParameters.cameraTilt)
 		self.SetCameraOrientation(self.robotParameters.cameraOrientation)
 
-	# Sets the position of the item, robot and obstacles based on parameters
 	def SetScene(self):
-		print('Setting up scene objects...')
-		
-		# Get bay handles for positioning items (ZMQ Remote API doesn't need streaming setup)
-		# bayHandles = np.zeros_like(self.sceneParameters.bayContents)
-		
-		# print('Attempting to get bay handles...')
-		# for shelf in range(6):
-		# 	for x in range(4):
-		# 		for y in range(3):
-		# 			bay_path = f"/Shelf{shelf}/Bay{x}{y}"
-		# 			try:
-		# 				print(f'Getting handle for {bay_path}')
-		# 				bayHandles[shelf,x,y] = self.sim.getObject(bay_path)
-		# 				print(f'Successfully got handle for {bay_path}')
-		# 			except Exception as e:
-		# 				print(f"Warning: Could not get bay handle for {bay_path}: {e}")
-		# 				print(f"This bay may not exist in the scene - continuing...")
-		# 				bayHandles[shelf,x,y] = -1  # Mark as invalid
-		
-		print('Bay handle retrieval completed.')
-		
-		# Set obstacle positions
-		print('Setting obstacle positions...')
+		"""
+		Builds the static EGB320 search and rescue maze scene.
+
+		Validates the maze configuration, clears any previously generated maze objects,
+		then generates the wall posts, internal walls and victims, and (optionally) places
+		the robot at its starting cell. Must be called while the simulation is stopped, since
+		it moves/scales/copies objects (this is done for us by StartSimulator).
+		"""
+		print('Preparing search and rescue maze scene...')
+
+		if not self.sceneParameters.autoGenerateMaze:
+			print('autoGenerateMaze is False - skipping maze generation.')
+			return
+
+		try:
+			self.sceneParameters.validate_maze_parameters()
+		except ValueError as e:
+			print(f"Error: invalid maze configuration: {e}")
+			sys.exit(-1)
+
+		if self.sceneParameters.clearGeneratedMaze:
+			removedCount = self._clear_generated_maze()
+		else:
+			removedCount = 0
+			self._ensure_generated_scene_root()
+
+		self._get_floor_info()
+		self._cache_template_geometry()
+
+		postCount = self._generate_wall_posts()
+		wallCount = self._generate_internal_walls()
+		victimCount = self._generate_victims()
+
+		self._park_templates_outside_playable_area()
+
+		if self.sceneParameters.robotStartingPosition is not None:
+			x, y, theta = self.sceneParameters.robotStartingPosition
+			self._set_robot_pose([x, y, theta])
+		elif self.sceneParameters.placeRobotAtBase:
+			self._place_robot_at_base()
+
+		self._log_table_wall_positions()
+		self._print_scene_summary(postCount, wallCount, victimCount, removedCount)
+
+		# Legacy 2025 warehouse extra - safe no-op when no legacy obstacles exist in the scene
+		self._legacy_set_obstacle_positions()
+
+	########################################
+	##### SEARCH AND RESCUE MAZE GENERATION #####
+	########################################
+	# Helper methods used by SetScene to build the maze. Students typically don't need to
+	# modify these functions.
+
+	def _get_shape_bbox_size(self, handle):
+		"""
+		Return the (sizeX, sizeY, sizeZ) bounding box dimensions of a shape, in its own
+		reference frame. Raises ValueError if the object is not a shape.
+		"""
+		try:
+			objectType = self.sim.getObjectType(handle)
+		except Exception as e:
+			raise ValueError(f"Could not determine object type for handle {handle}: {e}")
+
+		if objectType != self.sim.object_shape_type:
+			raise ValueError(f"Expected object handle {handle} to be a shape, but it is not (type={objectType}).")
+
+		try:
+			# sim.getShapeBB returns (sizeXYZ, pose7) - a 3-element size list plus the
+			# shape's local reference frame pose; we only need the size here.
+			boundingBox, _ = self.sim.getShapeBB(handle)
+		except Exception as e:
+			raise ValueError(f"Could not read bounding box for shape handle {handle}: {e}")
+
+		return boundingBox[0], boundingBox[1], boundingBox[2]
+
+	def _get_floor_info(self):
+		"""
+		Determine the floor centre (used as the default maze origin) and the floor's top
+		surface Z, and compute the maze's world-coordinate bounds. Also verifies the floor
+		is aligned with the world X/Y axes, since the grid maths below assumes this.
+		"""
+		floorPosition = self.sim.getObjectPosition(self.floorHandle, -1)
+		floorOrientation = self.sim.getObjectOrientation(self.floorHandle, -1)
+
+		orientationTolerance = 0.01  # radians (~0.57 degrees)
+		if abs(floorOrientation[0]) > orientationTolerance or abs(floorOrientation[1]) > orientationTolerance:
+			floorErrorMessage = (
+				f"Error: /floor is not aligned with the world X/Y plane (roll={floorOrientation[0]:.4f}, "
+				f"pitch={floorOrientation[1]:.4f} rad). Maze generation assumes an axis-aligned floor."
+			)
+			print(floorErrorMessage)
+			sys.exit(-1)
+		if abs(self.WrapToPi(floorOrientation[2])) > orientationTolerance:
+			floorYawWarning = (
+				f"Warning: /floor yaw is {floorOrientation[2]:.4f} rad - the maze grid follows the floor's "
+				f"local X/Y axes, so this should be a multiple of pi/2 for the grid to look axis-aligned."
+			)
+			print(floorYawWarning)
+
+		floorSizeX, floorSizeY, floorSizeZ = self._get_shape_bbox_size(self.floorHandle)
+
+		self.floorCenter = (floorPosition[0], floorPosition[1])
+		self.floorTopZ = floorPosition[2] + floorSizeZ / 2.0
+
+		if self.sceneParameters.mazeOriginXY is not None:
+			originX, originY = self.sceneParameters.mazeOriginXY
+		else:
+			originX, originY = self.floorCenter
+
+		mazeWidth = self.sceneParameters.mazeColumns * self.sceneParameters.mazeCellSize
+		mazeHeight = self.sceneParameters.mazeRows * self.sceneParameters.mazeCellSize
+
+		self.mazeXMinimum = originX - mazeWidth / 2.0
+		self.mazeYMaximum = originY + mazeHeight / 2.0
+
+		print(f"Floor centre: ({self.floorCenter[0]:.4f}, {self.floorCenter[1]:.4f}), floor top Z: {self.floorTopZ:.4f} m")
+		print(f"Maze origin: ({originX:.4f}, {originY:.4f}), footprint: {mazeWidth:.3f} m x {mazeHeight:.3f} m")
+
+	def _build_rotation_matrix(self, eulerOrientation):
+		"""
+		Build the 3x3 rotation matrix for a CoppeliaSim Euler orientation (alpha, beta, gamma),
+		using CoppeliaSim's Rx(alpha)*Ry(beta)*Rz(gamma) convention. Used to detect which local
+		axis of a template ends up vertical and which world direction another axis points at,
+		since templates aren't always authored with "up"/"forward" along local Z/X (e.g. a wall
+		modelled lying flat then rotated upright with a fixed roll).
+		"""
+		alpha, beta, gamma = eulerOrientation
+		cx, sx = math.cos(alpha), math.sin(alpha)
+		cy, sy = math.cos(beta), math.sin(beta)
+		cz, sz = math.cos(gamma), math.sin(gamma)
+
+		def matmul3(a, b):
+			return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+		Rx = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+		Ry = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+		Rz = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+		return matmul3(matmul3(Rx, Ry), Rz)
+
+	def _cache_template_geometry(self):
+		"""Cache template bounding boxes/orientations before templates are copied from or moved."""
+		self.mazeWallTemplateSize = self._get_shape_bbox_size(self.mazeWallTemplateHandle)
+		self.mazeWallTemplateOrientation = self.sim.getObjectOrientation(self.mazeWallTemplateHandle, -1)
+		self.wallPostTemplateSize = self._get_shape_bbox_size(self.wallPostTemplateHandle)
+		self.wallPostTemplateOrientation = self.sim.getObjectOrientation(self.wallPostTemplateHandle, -1)
+		try:
+			self.victimTemplateSize = self._get_shape_bbox_size(self.victimTemplateHandle)
+		except ValueError as e:
+			print(f"Warning: victim template is not a simple shape ({e}); using zero height for placement.")
+			self.victimTemplateSize = (0.0, 0.0, 0.0)
+		self.victimTemplateOrientation = self.sim.getObjectOrientation(self.victimTemplateHandle, -1)
+
+		# The maze_wall template's local X/Y/Z axes don't necessarily line up with "length/height
+		# /thickness" - e.g. it may be authored lying flat then rotated upright with a fixed roll.
+		# Find which local axis is vertical (under the template's own base orientation) so we scale
+		# and reorient the correct axis for each generated wall segment.
+		R = self._build_rotation_matrix(self.mazeWallTemplateOrientation)
+		worldZComponents = [abs(R[2][0]), abs(R[2][1]), abs(R[2][2])]
+		heightAxisIndex = worldZComponents.index(max(worldZComponents))
+		remainingAxes = [i for i in range(3) if i != heightAxisIndex]
+		if self.mazeWallTemplateSize[remainingAxes[0]] >= self.mazeWallTemplateSize[remainingAxes[1]]:
+			lengthAxisIndex = remainingAxes[0]
+		else:
+			lengthAxisIndex = remainingAxes[1]
+		self.mazeWallHeightAxisIndex = heightAxisIndex
+		self.mazeWallLengthAxisIndex = lengthAxisIndex
+		self.mazeWallWorldHeight = self.mazeWallTemplateSize[heightAxisIndex]
+		# World-frame yaw that the template's own length axis already points at, under its base
+		# orientation - needed so we rotate it by exactly the right extra amount for each segment.
+		self.mazeWallLengthAxisBaseYaw = math.atan2(R[1][lengthAxisIndex], R[0][lengthAxisIndex])
+
+		axisNames = ['X', 'Y', 'Z']
+		print(f"maze_wall template size (x,y,z): {self.mazeWallTemplateSize}, orientation: {self.mazeWallTemplateOrientation}")
+		print(f"maze_wall detected height axis: local {axisNames[heightAxisIndex]} ({self.mazeWallWorldHeight:.4f} m), "
+			  f"length axis: local {axisNames[lengthAxisIndex]} ({self.mazeWallTemplateSize[lengthAxisIndex]:.4f} m)")
+		print(f"wall_post template size (x,y,z): {self.wallPostTemplateSize}")
+		print(f"victim template size (x,y,z): {self.victimTemplateSize}")
+
+	def _grid_point_to_world(self, column, row):
+		"""Convert a maze grid intersection (column, row) into world (x, y) coordinates."""
+		cellSize = self.sceneParameters.mazeCellSize
+		x = self.mazeXMinimum + column * cellSize
+		y = self.mazeYMaximum - row * cellSize
+		return x, y
+
+	def _cell_center_to_world(self, column, row):
+		"""Convert a maze cell (column, row) into the world (x, y) coordinates of its centre."""
+		cellSize = self.sceneParameters.mazeCellSize
+		x = self.mazeXMinimum + (column + 0.5) * cellSize
+		y = self.mazeYMaximum - (row + 0.5) * cellSize
+		return x, y
+
+	def _generate_wall_posts(self):
+		"""Create one /wall_post copy at every grid intersection: (mazeRows+1) x (mazeColumns+1) posts."""
+		postHeight = self.wallPostTemplateSize[2]
+		count = 0
+		for row in range(self.sceneParameters.mazeRows + 1):
+			for column in range(self.sceneParameters.mazeColumns + 1):
+				x, y = self._grid_point_to_world(column, row)
+				newHandle = self.sim.copyPasteObjects([self.wallPostTemplateHandle], 0)[0]
+				zPos = self.floorTopZ + postHeight / 2.0
+				self.sim.setObjectPosition(newHandle, -1, [x, y, zPos])
+				self.sim.setObjectOrientation(newHandle, -1, list(self.wallPostTemplateOrientation))
+				self.sim.setObjectAlias(newHandle, f"EGB320_GEN_POST_R{row}_C{column}")
+				self.sim.setObjectParent(newHandle, self.generatedSceneRootHandle, True)
+				self.generatedWallPostHandles.append(newHandle)
+				count += 1
+		return count
+
+	def _create_wall_between_grid_points(self, startPoint, endPoint, index):
+		"""
+		Create a single maze_wall copy spanning the given grid intersections.
+		Scales only the template's long axis to match the segment length, and orients the
+		wall so that axis lies along the segment - this supports horizontal, vertical and
+		diagonal walls with a single code path.
+		"""
+		x1, y1 = self._grid_point_to_world(*startPoint)
+		x2, y2 = self._grid_point_to_world(*endPoint)
+
+		dx = x2 - x1
+		dy = y2 - y1
+		length = math.hypot(dx, dy)
+		if length < 1e-9:
+			raise ValueError(f"Wall segment {index} has zero length: {startPoint} -> {endPoint}")
+
+		segmentYaw = math.atan2(dy, dx)
+		midX = (x1 + x2) / 2.0
+		midY = (y1 + y2) / 2.0
+		zPos = self.floorTopZ + self.mazeWallWorldHeight / 2.0
+
+		newHandle = self.sim.copyPasteObjects([self.mazeWallTemplateHandle], 0)[0]
+
+		scaleFactor = length / self.mazeWallTemplateSize[self.mazeWallLengthAxisIndex]
+		scaleXYZ = [1.0, 1.0, 1.0]
+		scaleXYZ[self.mazeWallLengthAxisIndex] = scaleFactor
+		self.sim.scaleObject(newHandle, scaleXYZ[0], scaleXYZ[1], scaleXYZ[2], 0)
+
+		# Compose the extra yaw needed with the template's own natural tilt via a temporary
+		# reference dummy, rather than hand-rolling Euler/matrix composition: setting an
+		# object's position/orientation "relative to" another handle works regardless of
+		# actual parent-child hierarchy, so no reparenting is required.
+		deltaYaw = segmentYaw - self.mazeWallLengthAxisBaseYaw
+		helperDummy = self.sim.createDummy(0.01)
+		self.sim.setObjectPosition(helperDummy, -1, [midX, midY, zPos])
+		self.sim.setObjectOrientation(helperDummy, -1, [0, 0, deltaYaw])
+		self.sim.setObjectPosition(newHandle, helperDummy, [0, 0, 0])
+		self.sim.setObjectOrientation(newHandle, helperDummy, list(self.mazeWallTemplateOrientation))
+		self.sim.removeObject(helperDummy)
+
+		self.sim.setObjectAlias(newHandle, f"EGB320_GEN_WALL_{index:03d}")
+		self.sim.setObjectParent(newHandle, self.generatedSceneRootHandle, True)
+
+		self.generatedMazeWallHandles.append(newHandle)
+		return newHandle
+
+	def _generate_internal_walls(self):
+		"""Create one maze_wall copy for every segment in EXAMPLE_MAZE_SEGMENTS (40 walls)."""
+		count = 0
+		for index, (startPoint, endPoint) in enumerate(EXAMPLE_MAZE_SEGMENTS):
+			self._create_wall_between_grid_points(startPoint, endPoint, index)
+			count += 1
+		return count
+
+	def _generate_victims(self):
+		"""Create one /victim copy at each configured victim cell centre."""
+		victimHeight = self.victimTemplateSize[2]
+		clearance = 0.001  # small gap to avoid initial mesh penetration with the floor
+		count = 0
+		for label, cell in self.sceneParameters.victimCells.items():
+			column, row = cell
+			x, y = self._cell_center_to_world(column, row)
+			newHandle = self.sim.copyPasteObjects([self.victimTemplateHandle], 0)[0]
+			zPos = self.floorTopZ + victimHeight / 2.0 + clearance
+			self.sim.setObjectPosition(newHandle, -1, [x, y, zPos])
+			self.sim.setObjectOrientation(newHandle, -1, list(self.victimTemplateOrientation))
+			self.sim.setObjectAlias(newHandle, f"EGB320_GEN_VICTIM_{label}")
+			self.sim.setObjectParent(newHandle, self.generatedSceneRootHandle, True)
+			self.victimHandles[label] = newHandle
+			self.victimPositions[label] = [x, y, zPos]
+			count += 1
+		return count
+
+	def _park_templates_outside_playable_area(self):
+		"""Move the maze_wall, wall_post and victim templates outside the playable area (kept for future regeneration)."""
+		parkingSpots = {
+			self.mazeWallTemplateHandle: (-3.0, -3.0),
+			self.wallPostTemplateHandle: (-3.0, -3.5),
+			self.victimTemplateHandle: (-3.0, -4.0),
+		}
+		for handle, (parkX, parkY) in parkingSpots.items():
+			try:
+				currentPosition = self.sim.getObjectPosition(handle, -1)
+				self.sim.setObjectPosition(handle, -1, [parkX, parkY, currentPosition[2]])
+			except Exception as e:
+				print(f"Warning: could not park template handle {handle}: {e}")
+
+	def _set_robot_pose(self, pose2D):
+		"""Set the robot's 2D pose [x, y, theta], preserving its current Z coordinate."""
+		x, y, theta = pose2D
+		try:
+			currentPosition = self.sim.getObjectPosition(self.robotHandle, -1)
+			self.sim.setObjectPosition(self.robotHandle, -1, [x, y, currentPosition[2]])
+			self.sim.setObjectOrientation(self.robotHandle, -1, [0, 0, theta])
+			try:
+				self.sim.resetDynamicObject(self.robotHandle)
+			except Exception:
+				pass
+			print(f"Robot placed at ({x:.4f}, {y:.4f}) with yaw {theta:.4f} rad")
+		except Exception as e:
+			print(f"Warning: could not set robot starting pose: {e}")
+
+	def _place_robot_at_base(self):
+		"""Place the robot at the centre of sceneParameters.baseCell, facing sceneParameters.baseYaw."""
+		column, row = self.sceneParameters.baseCell
+		x, y = self._cell_center_to_world(column, row)
+		self._set_robot_pose([x, y, self.sceneParameters.baseYaw])
+
+	def _log_table_wall_positions(self):
+		"""Log the table_wall boundary positions and the maze grid's world-coordinate bounds."""
+		mazeWidth = self.sceneParameters.mazeColumns * self.sceneParameters.mazeCellSize
+		mazeHeight = self.sceneParameters.mazeRows * self.sceneParameters.mazeCellSize
+		xMax = self.mazeXMinimum + mazeWidth
+		yMin = self.mazeYMaximum - mazeHeight
+
+		print(f"Maze grid bounds: X [{self.mazeXMinimum:.4f}, {xMax:.4f}], Y [{yMin:.4f}, {self.mazeYMaximum:.4f}]")
+
+		for index, handle in enumerate(self.tableWallHandles):
+			try:
+				position = self.sim.getObjectPosition(handle, -1)
+				print(f"table_wall[{index}] position (x,y,z): {position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}")
+			except Exception as e:
+				print(f"Warning: could not read table_wall[{index}] position: {e}")
+
+	def _ensure_generated_scene_root(self):
+		"""Create the EGB320_GENERATED_SCENE dummy that all generated maze objects are parented to, if needed."""
+		existingHandle = self._try_get_object('/EGB320_GENERATED_SCENE')
+		if existingHandle is not None:
+			self.generatedSceneRootHandle = existingHandle
+			return
+		self.generatedSceneRootHandle = self.sim.createDummy(0.01)
+		self.sim.setObjectAlias(self.generatedSceneRootHandle, 'EGB320_GENERATED_SCENE')
+		self.sim.setObjectPosition(self.generatedSceneRootHandle, -1, [0, 0, 0])
+
+	def _remove_objects_by_alias_prefix(self, prefix):
+		"""Remove any scene object whose alias starts with the given prefix (cleanup safety net)."""
+		removed = 0
+		try:
+			allHandles = self.sim.getObjectsInTree(self.sim.handle_scene, self.sim.handle_all, 0)
+		except Exception as e:
+			print(f"Warning: could not enumerate scene objects for cleanup: {e}")
+			return removed
+		for handle in allHandles:
+			try:
+				alias = self.sim.getObjectAlias(handle)
+			except Exception:
+				continue
+			if alias and alias.startswith(prefix):
+				try:
+					self.sim.removeObject(handle)
+					removed += 1
+				except Exception:
+					pass
+		return removed
+
+	def _clear_generated_maze(self):
+		"""
+		Remove all previously generated maze objects (posts, walls, victims and their root
+		dummy), then create a fresh EGB320_GENERATED_SCENE root ready for the new maze.
+		Safe to call repeatedly: across StartSimulator() calls in the same process, sim
+		stop/start cycles, and fresh Python processes reconnecting to a scene that still
+		has leftover generated objects from a previous run.
+		"""
+		removedCount = 0
+
+		rootHandle = self._try_get_object('/EGB320_GENERATED_SCENE')
+		if rootHandle is not None:
+			try:
+				childHandles = self.sim.getObjectsInTree(rootHandle, self.sim.handle_all, 0)
+			except Exception as e:
+				print(f"Warning: could not enumerate previous generated objects: {e}")
+				childHandles = []
+			for childHandle in childHandles:
+				if childHandle == rootHandle:
+					continue
+				try:
+					self.sim.removeObject(childHandle)
+					removedCount += 1
+				except Exception:
+					pass
+			try:
+				self.sim.removeObject(rootHandle)
+				removedCount += 1
+			except Exception as e:
+				print(f"Warning: could not remove previous generated root: {e}")
+
+		# Fallback sweep in case objects lost their parent or the root was already removed
+		removedCount += self._remove_objects_by_alias_prefix('EGB320_GEN_')
+
+		self._ensure_generated_scene_root()
+
+		self.generatedMazeWallHandles = []
+		self.generatedWallPostHandles = []
+		self.victimHandles = {}
+		self.victimPositions = {}
+
+		print(f"Cleanup removed {removedCount} previously generated object(s).")
+		return removedCount
+
+	def _print_scene_summary(self, postCount, wallCount, victimCount, removedCount):
+		"""Print a concise summary of the generated search and rescue scene."""
+		mazeWidth = self.sceneParameters.mazeColumns * self.sceneParameters.mazeCellSize
+		mazeHeight = self.sceneParameters.mazeRows * self.sceneParameters.mazeCellSize
+		victimCellsText = ", ".join(f"{label}={cell}" for label, cell in self.sceneParameters.victimCells.items())
+
+		print("EGB320 search and rescue scene generated")
+		print(f"Grid: {self.sceneParameters.mazeRows} x {self.sceneParameters.mazeColumns} cells")
+		print(f"Cell size: {self.sceneParameters.mazeCellSize:.3f} m")
+		print(f"Maze footprint: {mazeWidth:.3f} m x {mazeHeight:.3f} m")
+		print(f"Posts created: {postCount}")
+		print(f"Internal walls created: {wallCount}")
+		print(f"Victims created: {victimCount}")
+		print(f"Base cell: {tuple(self.sceneParameters.baseCell)}")
+		print(f"Victim cells: {victimCellsText}")
+		print(f"Objects removed during cleanup: {removedCount}")
+
+	def _legacy_set_obstacle_positions(self):
+		"""Legacy 2025 warehouse-challenge obstacle placement. No-op when no legacy obstacles exist in the scene."""
+		if not any(h is not None for h in self.obstacleHandles):
+			return
 		obstacleHeight = 0.15
-		for index, obstaclePosition in enumerate([self.sceneParameters.obstacle0_StartingPosition, self.sceneParameters.obstacle1_StartingPosition, self.sceneParameters.obstacle2_StartingPosition]):
-			if obstaclePosition != -1:
-				if obstaclePosition != None:
-					coppeliaStartingPosition = [obstaclePosition[0], obstaclePosition[1], obstacleHeight/2]
-					try:
-						print(f'Setting obstacle {index} position to {coppeliaStartingPosition}')
-						self.sim.setObjectPosition(self.obstacleHandles[index], -1, coppeliaStartingPosition)
-					except Exception as e:
-						print(f"Warning: Error setting obstacle {index} position: {e}")
-				else:
-					try:
-						default_position = [2,  -0.3 + (-0.175*index), 0.8125]
-						print(f'Setting obstacle {index} to default position {default_position}')
-						self.sim.setObjectPosition(self.obstacleHandles[index], -1, default_position)
-					except Exception as e:
-						print(f"Warning: Error setting default obstacle {index} position: {e}")
-		
-		# Set picking station contents
-		print('Setting picking station contents...')
+		startingPositions = [
+			self.sceneParameters.obstacle0_StartingPosition,
+			self.sceneParameters.obstacle1_StartingPosition,
+			self.sceneParameters.obstacle2_StartingPosition,
+		]
+		for index, obstaclePosition in enumerate(startingPositions):
+			if self.obstacleHandles[index] is None or obstaclePosition is None or obstaclePosition == -1:
+				continue
+			coppeliaStartingPosition = [obstaclePosition[0], obstaclePosition[1], obstacleHeight / 2]
+			try:
+				self.sim.setObjectPosition(self.obstacleHandles[index], -1, coppeliaStartingPosition)
+			except Exception as e:
+				print(f"Warning: error setting legacy obstacle {index} position: {e}")
+
+	def _legacy_set_picking_station_contents(self):
+		"""Legacy 2025 warehouse-challenge picking station item placement. No-op when no legacy picking stations exist."""
+		if not any(h is not None for h in self.pickingStationMarkerHandles):
+			return
 		self.SetPickingStationContents()
-		
-		print('Scene setup completed.')
-		
-		
 
 	def SetPickingStationContents(self):
 		"""Place items at picking stations based on sceneParameters.pickingStationContents"""
@@ -1297,25 +1829,29 @@ class COPPELIA_WarehouseRobot(object):
 		# 	except Exception as e:
 		# 		print(f"Error getting item position for shelf {shelf}, position ({x},{y}): {e}")
 
-		# packingBay position
-		try:
-			pickingStationPosition = self.sim.getObjectPosition(self.pickingStationHandle, -1)
-			self.pickingStationPosition = pickingStationPosition
-		except Exception as e:
-			print(f"Error getting picking station position: {e}")
+		# packingBay position (legacy; no-op when no legacy picking station exists in the scene)
+		if self.pickingStationHandle is not None:
+			try:
+				self.pickingStationPosition = self.sim.getObjectPosition(self.pickingStationHandle, -1)
+			except Exception as e:
+				print(f"Error getting picking station position: {e}")
 
-		# obstacle positions
+		# obstacle positions (legacy; no-op for obstacles that don't exist in the scene)
 		obstaclePositions = [None, None, None]
 		for index, obs in enumerate(self.obstaclePositions):
+			if self.obstacleHandles[index] is None:
+				continue
 			try:
 				obstaclePositions[index] = self.sim.getObjectPosition(self.obstacleHandles[index], -1)
 				self.obstaclePositions[index] = obstaclePositions[index]
 			except Exception as e:
 				print(f"Error getting obstacle position {index}: {e}")
 
-		# row marker positions
+		# row marker positions (legacy; row markers no longer exist in the search and rescue scene)
 		rowMarkerPositions = [None,None,None]
 		for index, rowMarker in enumerate(self.rowMarkerPositions):
+			if self.rowMarkerHandles[index] is None:
+				continue
 			try:
 				rowMarkerPositions[index] = self.sim.getObjectPosition(self.rowMarkerHandles[index], -1)
 				self.rowMarkerPositions[index] = rowMarkerPositions[index]
@@ -1696,24 +2232,86 @@ class RobotParameters(object):
 
 
 class SceneParameters(object):
-	"""Parameters for configuring the warehouse scene"""
+	"""
+	Parameters for configuring the EGB320 search and rescue maze scene (2026).
+
+	Legacy 2025 warehouse-challenge fields are retained for backward compatibility but are
+	not used by the maze generation introduced in this phase.
+	"""
 	def __init__(self):
+		# --- Search and rescue maze parameters (2026) ---
+		self.mazeRows = 7
+		self.mazeColumns = 7
+		self.mazeCellSize = 0.280  # metres
+		self.mazeOriginXY = None   # None = use the centre of /floor as the maze origin
+		self.autoGenerateMaze = True
+		self.clearGeneratedMaze = True
+		self.baseCell = (0, 6)
+		self.baseYaw = math.pi / 2
+		self.victimCells = {
+			"L1": (1, 5),
+			"L2": (4, 3),
+			"L3": (6, 0),
+		}
+		self.placeRobotAtBase = True
+
+		# Robot starting position [x, y, theta] in metres and radians.
+		# If set, this overrides placeRobotAtBase/baseCell.
+		self.robotStartingPosition = None
+
+		# --- Legacy warehouse-challenge settings (2025 and earlier; unused in this phase) ---
 		# Picking station contents [station]. Set to -1 to leave empty.
 		# Index 0 = picking station 1, Index 1 = picking station 2, Index 2 = picking station 3
 		self.pickingStationContents = [-1, -1, -1]
-		
+
 		# Bay contents [shelf][x][y]. Set to -1 for empty bays.
 		# shelf: 0-5, x: 0-3, y: 0-2 (height levels)
-		# Not used currently
 		self.bayContents = np.full((6, 4, 3), -1, dtype=int)
-		
-		# Obstacle starting positions [x, y] in metres
+
+		# Obstacle starting positions [x, y] in metres.
 		# Set to -1 to use current CoppeliaSim position, None if not wanted in scene
 		self.obstacle0_StartingPosition = None
-		self.obstacle1_StartingPosition = None  
+		self.obstacle1_StartingPosition = None
 		self.obstacle2_StartingPosition = None
-		
-		# Robot starting position [x, y, theta] in metres and radians
-		# Set to None to use current CoppeliaSim position
-		self.robotStartingPosition = None
+
+	def validate_maze_parameters(self):
+		"""
+		Validate maze-related settings before any scene objects are created.
+		Raises ValueError with a clear message if a check fails.
+		"""
+		if self.mazeRows <= 0 or self.mazeColumns <= 0:
+			raise ValueError(f"mazeRows and mazeColumns must be positive (got {self.mazeRows} x {self.mazeColumns})")
+
+		if self.mazeCellSize <= 0:
+			raise ValueError(f"mazeCellSize must be positive (got {self.mazeCellSize})")
+
+		maxColumnIndex = self.mazeColumns
+		maxRowIndex = self.mazeRows
+
+		for (startPoint, endPoint) in EXAMPLE_MAZE_SEGMENTS:
+			for point in (startPoint, endPoint):
+				column, row = point
+				if not (0 <= column <= maxColumnIndex):
+					raise ValueError(f"Wall endpoint column {column} out of range [0, {maxColumnIndex}]: {point}")
+				if not (0 <= row <= maxRowIndex):
+					raise ValueError(f"Wall endpoint row {row} out of range [0, {maxRowIndex}]: {point}")
+			if startPoint == endPoint:
+				raise ValueError(f"Wall segment has identical start and end point: {startPoint}")
+
+		maxCellColumnIndex = self.mazeColumns - 1
+		maxCellRowIndex = self.mazeRows - 1
+		seenCells = set()
+		for label, cell in self.victimCells.items():
+			column, row = cell
+			if not (0 <= column <= maxCellColumnIndex):
+				raise ValueError(f"Victim '{label}' column {column} out of range [0, {maxCellColumnIndex}]")
+			if not (0 <= row <= maxCellRowIndex):
+				raise ValueError(f"Victim '{label}' row {row} out of range [0, {maxCellRowIndex}]")
+			if cell in seenCells:
+				raise ValueError(f"Victim cells must be unique - duplicate cell {cell}")
+			seenCells.add(cell)
+
+		if tuple(self.baseCell) in seenCells:
+			raise ValueError(f"baseCell {self.baseCell} must not coincide with a victim cell")
+
 
