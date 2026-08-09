@@ -63,9 +63,6 @@ robotParameters.driveSystemQuality = 1
 
 # Configure scene parameters
 sceneParameters = SceneParameters()
-sceneParameters.pickingStationContents[0] = warehouseObjects.bowl
-sceneParameters.pickingStationContents[1] = warehouseObjects.mug
-sceneParameters.pickingStationContents[2] = warehouseObjects.bottle
 
 # Initialize robot
 robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
@@ -78,16 +75,14 @@ try:
         robot.UpdateObjectPositions()
         
         # Get object detections
-        objects = robot.GetDetectedObjects([warehouseObjects.items, warehouseObjects.obstacles])
-        items, _, obstacles, _, _, _ = objects
+        objects = robot.GetDetectedObjects([warehouseObjects.obstacles])
+        _, _, obstacles, _, _, _ = objects
         
         # Simple navigation
-        if len(obstacles) > 0:
+        if obstacles:
             robot.SetTargetVelocities(0.0, 0.3)  # Turn away from obstacles
-        elif len(items) > 0:
-            robot.SetTargetVelocities(0.1, 0.0)  # Move towards items
         else:
-            robot.SetTargetVelocities(0.0, 0.2)  # Search by rotating
+            robot.SetTargetVelocities(0.1, 0.0)
         
         time.sleep(0.1)
         
@@ -172,19 +167,14 @@ robot.SetTargetVelocities(0.0, 0.0)    # Stop
 
 #### `GetDetectedObjects(objects=None)`
 
-Gets range and bearing to all detected objects in the camera's field of view.
+Gets range and bearing to requested obstacles in the camera's field of view.
 
 **Parameters:**
-- `objects` (list, optional): List of object types to detect. If None, detects all objects.
+- `objects` (list, optional): Obstacle types to detect. If `None`, detects all obstacles.
 
 **Returns:** 
-- `tuple`: (itemsRB, packingStationRB, obstaclesRB, rowMarkerRB, shelfRB, pickingStationRB)
-  - `itemsRB` (list): Range and bearing to items [6-element list, one per item type]
-  - `packingStationRB` (list): Range and bearing to main picking station
-  - `obstaclesRB` (list): Range and bearing to obstacles
-  - `rowMarkerRB` (list): Range and bearing to row markers [3-element list]
-  - `shelfRB` (list): Range and bearing to shelves [6-element list]
-  - `pickingStationRB` (list): Range and bearing to individual picking stations [3-element list]
+- `tuple`: Legacy six-value result with `obstaclesRB` in the third position. The retired
+  pick-and-place fields are retained as empty placeholders for compatibility.
 
 **Data Format:**
 Each detection is a `[range, bearing]` array where:
@@ -193,15 +183,13 @@ Each detection is a `[range, bearing]` array where:
 
 **Example:**
 ```python
-# Detect items and obstacles
-objects = robot.GetDetectedObjects([warehouseObjects.items, warehouseObjects.obstacles])
-items, _, obstacles, _, _, _ = objects
+# Detect all obstacles
+objects = robot.GetDetectedObjects([warehouseObjects.obstacles])
+_, _, obstacles, _, _, _ = objects
 
-# Check for detected items
-if items[warehouseObjects.bowl] is not None:
-    for detection in items[warehouseObjects.bowl]:
-        range_m, bearing_rad = detection
-        print(f"Bowl detected at {range_m:.2f}m, {math.degrees(bearing_rad):.1f}°")
+if obstacles:
+    for range_m, bearing_rad in obstacles:
+        print(f"Obstacle detected at {range_m:.2f} m")
 ```
 
 ---
@@ -221,6 +209,29 @@ resolution, image_data = robot.GetCameraImage()
 if image_data is not None:
     width, height = resolution
     print(f"Got image: {width}x{height} pixels")
+```
+
+---
+
+#### `GetWallDistances()`
+
+Reads the three proximity sensors mounted on the robot. Directions are relative to the
+robot's current orientation, and values are measured in metres from each sensor's origin.
+Although named as wall distances for convenience, the sensors can detect any detectable
+scene object in their sensing volume.
+
+**Returns:**
+- `dict`: Keys are `left`, `front`, and `right`. Each value is a distance in metres, or
+  `None` when nothing is detected within that sensor's configured range.
+
+**Example:**
+```python
+distances = robot.GetWallDistances()
+
+if distances['front'] is None:
+    print('No object detected in front')
+else:
+    print(f"Front distance: {distances['front']:.3f} m")
 ```
 
 ---
@@ -354,41 +365,15 @@ if success:
 
 #### `warehouseObjects` (Enum)
 
-Enumeration of all object types in the warehouse simulation.
-
-**Item Types:**
-- `warehouseObjects.bowl` (0): Cereal bowls
-- `warehouseObjects.mug` (1): Coffee mugs
-- `warehouseObjects.bottle` (2): Water bottles
-- `warehouseObjects.soccer` (3): Soccer balls
-- `warehouseObjects.rubiks` (4): Rubik's cubes
-- `warehouseObjects.cereal` (5): Cereal boxes
+Obstacle types retained for the search-and-rescue simulation.
 
 **Obstacle Types:**
 - `warehouseObjects.obstacle0` (6): First obstacle
 - `warehouseObjects.obstacle1` (7): Second obstacle
 - `warehouseObjects.obstacle2` (8): Third obstacle
 
-**Station Types:**
-- `warehouseObjects.pickingStation` (9): Main picking station
-- `warehouseObjects.pickingStation1` (19): Individual picking station 1
-- `warehouseObjects.pickingStation2` (20): Individual picking station 2
-- `warehouseObjects.pickingStation3` (21): Individual picking station 3
-
-**Navigation Types:**
-- `warehouseObjects.row_marker_1` (10): Row marker 1
-- `warehouseObjects.row_marker_2` (11): Row marker 2
-- `warehouseObjects.row_marker_3` (12): Row marker 3
-
-**Storage Types:**
-- `warehouseObjects.shelf_0` through `warehouseObjects.shelf_5` (13-18): Storage shelves
-
 **Object Groups:**
-- `warehouseObjects.items` (101): All collectible items
 - `warehouseObjects.obstacles` (102): All obstacles
-- `warehouseObjects.row_markers` (103): All row markers
-- `warehouseObjects.shelves` (104): All shelves
-- `warehouseObjects.PickingStationMarkers` (105): All individual picking stations
 
 ---
 

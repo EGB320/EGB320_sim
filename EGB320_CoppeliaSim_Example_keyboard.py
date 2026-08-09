@@ -13,13 +13,20 @@ GETTING STARTED:
 WHAT THIS EXAMPLE DOES:
 ======================
 - Connects to CoppeliaSim
-- Generates the Phase 1 example maze (7x7 cells, wall posts, victims)
+- Generates the Phase 1 example maze (7x7 cells, wall posts and three victims)
 - Places the robot at the base cell
-- Shows basic robot movement and prints the robot pose and victim positions
+- Lets you drive the robot around with the keyboard (WASD + space to stop)
+
+KEYBOARD CONTROLS:
+==================
+W / S - drive forward / backward
+A / D - rotate left / right on the spot
+SPACE - stop
+Q     - quit
+Hold a movement key to drive. Releasing the key immediately commands zero velocity.
 
 STUDENT TASKS:
 =============
-- Modify the robot movement commands in the main loop
 - Implement navigation/mapping using object and wall detection data
 - Victim detection/collection is not implemented in this phase - that's up to you
 
@@ -31,10 +38,52 @@ from warehousebot_lib import *
 
 # Import additional modules
 import os
+import ctypes
+
+try:
+	if os.name != 'nt':
+		raise OSError("held-key polling is only available on Windows")
+	_get_async_key_state = ctypes.windll.user32.GetAsyncKeyState
+	_get_async_key_state.argtypes = [ctypes.c_int]
+	_get_async_key_state.restype = ctypes.c_short
+	_HAS_HELD_KEY_INPUT = True
+except (AttributeError, OSError):
+	_get_async_key_state = None
+	_HAS_HELD_KEY_INPUT = False
+
+_VIRTUAL_KEYS = {
+	'w': 0x57,
+	'a': 0x41,
+	's': 0x53,
+	'd': 0x44,
+	'space': 0x20,
+	'q': 0x51,
+}
 
 def clear_screen():
 	"""Clear the terminal screen for better output readability"""
 	os.system('cls' if os.name == 'nt' else 'clear')
+
+def is_key_down(key):
+	"""Return whether a keyboard key is currently held down."""
+	if not _HAS_HELD_KEY_INPUT:
+		return False
+	return bool(_get_async_key_state(_VIRTUAL_KEYS[key]) & 0x8000)
+
+def get_keyboard_command():
+	"""Return the velocity command represented by the currently held keys."""
+	if is_key_down('q'):
+		raise KeyboardInterrupt
+	if is_key_down('space'):
+		return 0.0, 0.0
+
+	linearVelocity = keyboardForwardSpeed * (int(is_key_down('w')) - int(is_key_down('s')))
+	angularVelocity = keyboardTurnSpeed * (int(is_key_down('a')) - int(is_key_down('d')))
+	return linearVelocity, angularVelocity
+
+def format_distance(distance):
+	"""Format an optional proximity reading for the terminal display."""
+	return "no detection" if distance is None else f"{distance:0.3f} m"
 
 # CONFIGURE SCENE PARAMETERS (search and rescue maze)
 sceneParameters = SceneParameters()
@@ -43,9 +92,6 @@ sceneParameters = SceneParameters()
 # by default in SceneParameters.__init__ - override any of these to experiment, e.g.:
 # sceneParameters.placeRobotAtBase = False
 # sceneParameters.clearGeneratedMaze = False  # leave a previously generated maze in place
-
-# Diagnostic setup: clear old generated objects and run on a blank table.
-sceneParameters.generateMazeObjects = False
 
 # CONFIGURE ROBOT PARAMETERS
 robotParameters = RobotParameters()
@@ -69,6 +115,10 @@ robotParameters.maxCollectDistance = 0.15         # Maximum collection distance 
 # Simulation settings
 robotParameters.sync = False  # Use asynchronous mode (recommended)
 
+# KEYBOARD TELEOPERATION SETTINGS
+keyboardForwardSpeed = 0.03   # m/s applied when driving forward/backward (kept low to avoid abrupt starts)
+keyboardTurnSpeed = 0.3       # rad/s applied when rotating left/right (kept low to avoid abrupt starts)
+
 # MAIN PROGRAM
 if __name__ == '__main__':
 	# Use try-except to handle Ctrl+C gracefully
@@ -87,18 +137,30 @@ if __name__ == '__main__':
 		# Start the simulation (generates the maze, then starts the simulation)
 		warehouseBotSim.StartSimulator()
 
+		if not _HAS_HELD_KEY_INPUT:
+			print("Warning: held-key input is unavailable - keyboard control is disabled on this platform.")
+
 		# Main control loop
 		print("Starting main control loop...")
-		print("Robot is being commanded forward at 0.08 m/s.")
-		
+		print("Use W/A/S/D to drive, SPACE to stop, Q to quit.")
+
+		lastSentCommand = (0.0, 0.0)
+
 		while True:
-			# Set robot movement (forward_velocity, rotation_velocity)
-			# Fixed command for testing SetTargetVelocities without keyboard input.
-			warehouseBotSim.SetTargetVelocities(0.08, 0.0)
+			# Send only when the held-key command changes. Releasing the movement keys changes
+			# the command to (0, 0), so exactly one stop command is sent on release.
+			keyboardCommand = get_keyboard_command()
+			if keyboardCommand != lastSentCommand:
+				warehouseBotSim.SetTargetVelocities(*keyboardCommand)
+				lastSentCommand = keyboardCommand
+
+
+			# Robot-relative proximity readings. None means no detectable object is in range.
+			wallDistances = warehouseBotSim.GetWallDistances()
 
 			# Optional: Get camera image for computer vision processing
 			# This will slow down the sim
-			#resolution, image_data = warehouseBotSim.GetCameraImage()
+			resolution, image_data = warehouseBotSim.GetCameraImage()
 
 			# Update object positions (required for accurate detection)
 			warehouseBotSim.UpdateObjectPositions()
@@ -108,9 +170,19 @@ if __name__ == '__main__':
 				clear_screen()
 				print("EGB320 Search and Rescue Robot - Status")
 				print("=" * 50)
+				print("Controls: W/S = forward/back, A/D = rotate, SPACE = stop, Q = quit")
+				print(
+					f"Commanded velocity (x_dot, theta_dot): {lastSentCommand[0]:0.2f} m/s, "
+					f"{lastSentCommand[1]:0.2f} rad/s")
 
 				if warehouseBotSim.robotPose is not None:
 					print("Robot pose (x, y, theta): %0.3f, %0.3f, %0.3f" % tuple(warehouseBotSim.robotPose[:3]))
+
+				print(
+					"Wall Distance sensors: "
+					f"left={format_distance(wallDistances['left'])}, "
+					f"front={format_distance(wallDistances['front'])}, "
+					f"right={format_distance(wallDistances['right'])}")
 
 				# Ground-truth victim positions (victim detection is not implemented in this phase)
 				for label, position in warehouseBotSim.victimPositions.items():

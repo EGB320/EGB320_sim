@@ -4,6 +4,7 @@ import time
 import math
 import numpy as np
 import sys
+from collections import deque
 from enum import IntEnum
 
 """
@@ -28,7 +29,7 @@ Robot Control:
 Object Detection:
 - GetDetectedObjects(objects)           : Get range/bearing to all detected objects (legacy warehouse objects)
 - GetCameraImage()                      : Get camera image for computer vision
-- GetDetectedWallPoints()               : Get range/bearing to visible walls
+- GetWallDistances()                    : Get robot-relative left/front/right proximity readings
 
 Legacy Item Collection (2025 warehouse challenge, unused in this phase):
 - CollectItem(closest_picking_station)  : Collect items from picking stations
@@ -124,47 +125,15 @@ EXAMPLE_MAZE_SEGMENTS = [
 
 
 
-# This class defines object types in the warehouse simulation
+# Object types retained for the search-and-rescue challenge.
 class warehouseObjects(IntEnum):
-	
-	# Item types
-	bowl = 0
-	mug = 1
-	bottle = 2
-	soccer = 3
-	rubiks = 4
-	cereal = 5
-
 	# Obstacle objects
 	obstacle0 = 6
 	obstacle1 = 7
 	obstacle2 = 8
-	
-	# Picking station objects
-	pickingStation = 22
-	pickingStation1 = 19
-	pickingStation2 = 20
-	pickingStation3 = 21
 
-	# Row marker objects
-	row_marker_1 = 10
-	row_marker_2 = 11
-	row_marker_3 = 12
-
-	# Shelf objects
-	shelf_0 = 13
-	shelf_1 = 14
-	shelf_2 = 15
-	shelf_3 = 16
-	shelf_4 = 17
-	shelf_5 = 18
-
-	# Object groups for detection
-	items = 101
+	# Obstacle group for detection
 	obstacles = 102
-	row_markers = 103
-	shelves = 104
-	PickingStationMarkers = 105
 
 
 ################################
@@ -230,20 +199,31 @@ class COPPELIA_WarehouseRobot(object):
 		self.shelfHandles = [None]*6
 		self.bayHandles = np.full((6,4,3), None, dtype=object)
 		self.proximityHandle = None
+		self.distanceSensorHandles = {
+			'left': None,
+			'front': None,
+			'right': None,
+		}
 
 		# Search and rescue maze scene object handles (essential for this phase)
 		self.floorHandle = None
 		self.tableWallHandles = []
 		self.mazeWallTemplateHandle = None
+		self.baseStationWallTemplateHandle = None
+		self.victimWallTemplateHandle = None
+		self.rubbleVictimWallTemplateHandle = None
+		self.hazardWallTemplateHandle = None
 		self.wallPostTemplateHandle = None
 		self.victimTemplateHandle = None
 
 		# Generated maze object bookkeeping (used for cleanup on regeneration)
 		self.generatedSceneRootHandle = None
 		self.generatedMazeWallHandles = []
+		self.generatedMarkerWallHandles = []
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
+		self.markerWallPlacements = []
 
 		# Cached maze geometry (populated by _get_floor_info/_cache_template_geometry)
 		self.floorCenter = None
@@ -251,6 +231,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.mazeXMinimum = None
 		self.mazeYMaximum = None
 		self.mazeWallTemplateSize = None
+		self.wallTemplateGeometry = {}
 		self.wallPostTemplateSize = None
 		self.wallPostTemplateOrientation = None
 		self.victimTemplateSize = None
@@ -386,21 +367,18 @@ class COPPELIA_WarehouseRobot(object):
 
 	def GetDetectedObjects(self, objects=None):
 		"""
-		Gets the range and bearing to all detected objects in the camera's field of view.
+		Gets the range and bearing to requested obstacles in the camera's field of view.
 		
 		Args:
-			objects: List of object types to detect (default: all objects)
+			objects: List containing warehouseObjects.obstacles and/or individual obstacle
+				types. Defaults to all obstacles.
 			
 		Returns:
-			tuple: (itemsRB, packingStationRB, obstaclesRB, rowMarkerRB, shelfRB, pickingStationRB)
-				- itemsRB: Range and bearing to items [6-element list, one per item type]
-				- packingStationRB: Range and bearing to main picking station
-				- obstaclesRB: Range and bearing to obstacles  
-				- rowMarkerRB: Range and bearing to row markers [3-element list]
-				- shelfRB: Range and bearing to shelves [6-element list]
-				- pickingStationRB: Range and bearing to individual picking stations [3-element list]
+			tuple: Legacy six-value result with obstaclesRB in the third position. Retired
+				pick-and-place result fields remain empty for compatibility.
 		"""
-		# Initialize return variables
+		# Retain the historical return shape while the student API transitions away from
+		# the pick-and-place challenge.
 		itemRangeBearing = [None]*6
 		pickingStationRangeBearing = None
 		obstaclesRangeBearing = None
@@ -408,13 +386,22 @@ class COPPELIA_WarehouseRobot(object):
 		shelfRangeBearing = [None]*6
 		pickingStationMarkersRangeBearing = [None, None, None]
 
-		# Default to detecting all objects if none specified
+		# Default to detecting all obstacles if none are specified.
 		if objects is None:
-			objects = [warehouseObjects.items, warehouseObjects.shelves, warehouseObjects.row_markers,
-					  warehouseObjects.obstacles, warehouseObjects.pickingStation, warehouseObjects.PickingStationMarkers]
+			objects = [warehouseObjects.obstacles]
 
-		# Check if camera pose is available
-		if self.cameraPose is None:
+		requestedObjects = set(objects)
+		obstacleTypes = (
+			warehouseObjects.obstacle0,
+			warehouseObjects.obstacle1,
+			warehouseObjects.obstacle2,
+		)
+		detectAllObstacles = warehouseObjects.obstacles in requestedObjects
+		if not detectAllObstacles and not any(obstacle in requestedObjects for obstacle in obstacleTypes):
+			return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
+
+		# Check if camera and detector data are available.
+		if self.cameraPose is None or self.objectDetectorHandle is None:
 			return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
 
 		# Get object detection data from CoppeliaSim vision sensor
@@ -426,93 +413,24 @@ class COPPELIA_WarehouseRobot(object):
 			else:
 				objectsDetected = packets
 				
-		except Exception as e:
+		except Exception:
 			objectsDetected = []
+
 		if objectsDetected and len(objectsDetected) > 0:
-			
-			# Check for shelves (indices 13-18 in detection array)
-			if warehouseObjects.shelves in objects:
-				shelfRB = self.GetShelfRangeBearing()
-				for index, rb in enumerate(shelfRB):
-					shelf_index = 13 + index
-					if self._is_object_detected(objectsDetected, shelf_index):
-						if rb and rb[0] < self.robotParameters.maxShelfDetectionDistance:
-							shelfRangeBearing[index] = rb
-
-			# Check for items (indices 0-5: bowl, mug, bottle, soccer, rubiks, cereal)
-			if warehouseObjects.items in objects:
-				for item_type in range(6):
-					if self._is_object_detected(objectsDetected, item_type):
-						item_names = ["BOWL", "MUG", "BOTTLE", "SOCCER_BALL", "RUBIKS_CUBE", "CEREAL_BOX"]
-						item_name = item_names[item_type]
-						
-						try:
-							item_handle = self.sim.getObject(f'/{item_name}')
-							item_position = self.sim.getObjectPosition(item_handle, -1)
-							
-							result = self._process_single_object_detection(
-								item_position, item_type, objectsDetected, 
-								self.robotParameters.maxItemDetectionDistance)
-							
-							if result is not None:
-								self._add_item_to_range_bearing(itemRangeBearing, item_type, result)
-						except Exception:
-							pass
-				# Check for items at picking stations
-				for station_index in range(3):
-					item_type = self.sceneParameters.pickingStationContents[station_index]
-					
-					if item_type != -1 and 0 <= item_type <= 5:
-						station_handle = self.pickingStationMarkerHandles[station_index]
-						
-						if station_handle is not None:
-							try:
-								station_position = self.sim.getObjectPosition(station_handle, -1)
-								item_position = [station_position[0], station_position[1], station_position[2]]
-								
-								if self._is_object_detected(objectsDetected, item_type) and self.PointInsideArena(item_position):
-									_valid, _range, _bearing = self.GetRBInCameraFOV(item_position)
-									
-									if _range < self.robotParameters.maxItemDetectionDistance and abs(_bearing) < self.robotParameters.cameraPerspectiveAngle/2:
-										self._add_item_to_range_bearing(itemRangeBearing, item_type, [_range, _bearing])
-							except Exception:
-								pass
-			# Check for obstacles (indices 6-8)
-			if warehouseObjects.obstacles in objects:
-				for index, obstaclePosition in enumerate(self.obstaclePositions):
-					if obstaclePosition is not None:
-						result = self._process_single_object_detection(obstaclePosition, 6 + index, objectsDetected, self.robotParameters.maxObstacleDetectionDistance)
-						if result is not None:
-							if obstaclesRangeBearing is None:
-								obstaclesRangeBearing = []
-							obstaclesRangeBearing.append(result)
-
-			# Check for main picking station (index 9)
-			if warehouseObjects.pickingStation in objects:
-				if self.pickingStationPosition is not None:
-					pickingStationRangeBearing = self._process_single_object_detection(
-						self.pickingStationPosition, 22, objectsDetected, self.robotParameters.maxPickingStationDetectionDistance)
-
-			# Check for row markers (indices 10-12)
-			if warehouseObjects.row_markers in objects:
-				rowMarkerRangeBearing = self._process_multiple_object_detection(
-					self.rowMarkerPositions, 10, objectsDetected, self.robotParameters.maxRowMarkerDetectionDistance)
-
-			# Check for individual picking stations (indices 19-21)
-			if warehouseObjects.PickingStationMarkers in objects:
-				for station_index in range(3):
-					if self._is_object_detected(objectsDetected, 19 + station_index):
-						station_handle = self.pickingStationMarkerHandles[station_index]
-						if station_handle is not None:
-							try:
-								station_position = self.sim.getObjectPosition(station_handle, -1)
-								result = self._process_single_object_detection(
-									station_position, 19 + station_index, objectsDetected, 
-									self.robotParameters.maxPickingStationMarkersDetectionDistance)
-								if result is not None:
-									pickingStationMarkersRangeBearing[station_index] = result
-							except Exception:
-								pass
+			# Obstacles retain their historical detector packet indices 6-8.
+			for index, obstaclePosition in enumerate(self.obstaclePositions):
+				if not detectAllObstacles and obstacleTypes[index] not in requestedObjects:
+					continue
+				if obstaclePosition is not None:
+					result = self._process_single_object_detection(
+						obstaclePosition,
+						int(obstacleTypes[index]),
+						objectsDetected,
+						self.robotParameters.maxObstacleDetectionDistance)
+					if result is not None:
+						if obstaclesRangeBearing is None:
+							obstaclesRangeBearing = []
+						obstaclesRangeBearing.append(result)
 
 		return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
 
@@ -543,27 +461,52 @@ class COPPELIA_WarehouseRobot(object):
 	
 	def GetDetectedWallPoints(self):
 		"""
-		Gets the range and bearing to wall points visible in the camera's field of view.
-		
+		Legacy compatibility stub; wall-point estimation is not supported for the 2026 maze.
+
+		The previous warehouse implementation only intersected the camera field-of-view with
+		four fixed, axis-aligned arena boundaries. It does not account for generated internal
+		maze walls or diagonal wall segments and therefore produced misleading readings.
+		Use GetWallDistances() for the robot-relative proximity sensors instead. A future
+		version may replace this stub with geometry-based or vision-based wall detection.
+
 		Returns:
-			list: List of [range, bearing] arrays for visible wall points, or None if no walls detected
+			None: Always, while maze wall-point detection is unsupported.
 		"""
-		if self.cameraPose is None:
-			return None
-		
-		cameraPose2D = [self.cameraPose[0], self.cameraPose[1], self.cameraPose[5]]
+		return None
 
-		# Get range and bearing to wall intersection points
-		wallPoints = self.CameraViewLimitsRangeAndBearing(cameraPose2D)
-		if wallPoints is None:
-			return None
+	def GetWallDistances(self):
+		"""
+		Read the three robot-relative proximity sensors.
 
-		# Check for corners in field of view
-		cornerRangeBearing = self.FieldCornerRangeBearing(cameraPose2D)
-		if cornerRangeBearing:
-			wallPoints.append(cornerRangeBearing)
-			
-		return wallPoints
+		Returns:
+			dict: ``{'left': distance, 'front': distance, 'right': distance}``, where
+				each detected distance is measured in metres from that sensor's origin. A value
+				of ``None`` means that the sensor detected nothing within its configured range,
+				or that the optional sensor is not present in the scene.
+
+		The direction names are relative to the robot, not the world. Proximity sensors can
+		detect any scene object configured as detectable, so a reading is not guaranteed to
+		come from a wall.
+		"""
+		distances = {}
+		for direction in ('left', 'front', 'right'):
+			handle = self.distanceSensorHandles.get(direction)
+			if handle is None:
+				distances[direction] = None
+				continue
+
+			try:
+				detectionState, distance, _point, _objectHandle, _normal = self.sim.readProximitySensor(handle)
+			except Exception:
+				distances[direction] = None
+				continue
+
+			if detectionState == 1 and distance is not None and math.isfinite(distance) and distance >= 0.0:
+				distances[direction] = float(distance)
+			else:
+				distances[direction] = None
+
+		return distances
 		
 
 	def SetTargetVelocities(self, x_dot, theta_dot):
@@ -574,13 +517,16 @@ class COPPELIA_WarehouseRobot(object):
 			x_dot: Forward velocity in m/s
 			theta_dot: Rotational velocity in rad/s
 		"""
+		if not (math.isfinite(x_dot) and math.isfinite(theta_dot)):
+			print(f"Warning: ignoring non-finite velocity command (x_dot={x_dot}, theta_dot={theta_dot}); stopping instead.")
+			x_dot, theta_dot = 0.0, 0.0
+
 		if self.robotParameters.driveType == 'differential':
 			# Robot physical parameters (fixed for the simulation)
 			self.robotParameters.wheelBase = 0.15
 			self.robotParameters.wheelRadius = 0.03
 
 			# Calculate speed limits
-			minWheelSpeed = self.robotParameters.minimumLinearSpeed / self.robotParameters.wheelRadius
 			maxWheelSpeed = self.robotParameters.maximumLinearSpeed / self.robotParameters.wheelRadius
 
 			# Calculate individual wheel speeds
@@ -592,9 +538,13 @@ class COPPELIA_WarehouseRobot(object):
 				leftWheelSpeed = np.random.normal(leftWheelSpeed, (1-self.robotParameters.driveSystemQuality)*1, 1)[0]
 				rightWheelSpeed = np.random.normal(rightWheelSpeed, (1-self.robotParameters.driveSystemQuality)*1, 1)[0]
 
-			# Limit wheel speeds
-			leftWheelSpeed = min(leftWheelSpeed, maxWheelSpeed)
-			rightWheelSpeed = min(rightWheelSpeed, maxWheelSpeed)
+			# Limit wheel speeds to +/- maxWheelSpeed (both directions - forward and reverse)
+			leftWheelSpeed = max(min(leftWheelSpeed, maxWheelSpeed), -maxWheelSpeed)
+			rightWheelSpeed = max(min(rightWheelSpeed, maxWheelSpeed), -maxWheelSpeed)
+
+			if not (math.isfinite(leftWheelSpeed) and math.isfinite(rightWheelSpeed)):
+				print("Warning: computed non-finite wheel speeds; stopping motors instead.")
+				leftWheelSpeed, rightWheelSpeed = 0.0, 0.0
 
 			# Set motor speeds
 			try:
@@ -936,7 +886,7 @@ class COPPELIA_WarehouseRobot(object):
 
 		Only the robot, drive motors, floor, table boundary walls, and the maze/post/victim
 		templates are required in this phase - startup aborts if any of these are missing.
-		Robot sensors (vision sensor, object detector, proximity sensor, collector force
+		Robot sensors (vision sensor, object detector, proximity/distance sensors, collector force
 		sensor, rear motors) are optional and resolved best-effort using candidate paths that
 		cover both the new and legacy scene layouts. Legacy 2025 warehouse objects (picking
 		stations, obstacles, row markers, shelves, item templates) are resolved best-effort
@@ -973,9 +923,24 @@ class COPPELIA_WarehouseRobot(object):
 			self.tableWallHandles.append(handle)
 
 		self.mazeWallTemplateHandle = self._resolve_first_available(['/maze_wall'], 'maze_wall template', required=True)
+		self.baseStationWallTemplateHandle = self._resolve_first_available(
+			['/base_station_wall'], 'base_station_wall template', required=True)
+		self.victimWallTemplateHandle = self._resolve_first_available(
+			['/victim_wall'], 'victim_wall template', required=True)
+		self.rubbleVictimWallTemplateHandle = self._resolve_first_available(
+			['/rubble_victim_wall'], 'rubble_victim_wall template', required=True)
+		self.hazardWallTemplateHandle = self._resolve_first_available(
+			['/hazard_wall'], 'hazard_wall template', required=True)
 		self.wallPostTemplateHandle = self._resolve_first_available(['/wall_post'], 'wall_post template', required=True)
 		self.victimTemplateHandle = self._resolve_first_available(['/victim'], 'victim template', required=True)
-		if self.mazeWallTemplateHandle is None or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
+		wallTemplateHandles = (
+			self.mazeWallTemplateHandle,
+			self.baseStationWallTemplateHandle,
+			self.victimWallTemplateHandle,
+			self.rubbleVictimWallTemplateHandle,
+			self.hazardWallTemplateHandle,
+		)
+		if any(handle is None for handle in wallTemplateHandles) or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
 			sys.exit(-1)
 
 		# --- Optional: robot sensors (candidate paths cover both the new and legacy scene layouts) ---
@@ -983,6 +948,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.GetCameraHandle()
 		self.GetObjectDetectorHandle()
 		self.getProximityhandle()
+		self.GetDistanceSensorHandles()
 
 		# --- Legacy (2025 warehouse challenge) objects: best-effort only, never abort startup ---
 		# Picking stations, item templates, row markers and shelves/bays no longer exist in the
@@ -1151,6 +1117,22 @@ class COPPELIA_WarehouseRobot(object):
 			['/Robot/VisionSensor/Proximity_sensor', '/Proximity_sensor'], 'Proximity_sensor', required=False)
 		return 0 if self.proximityHandle is not None else -1
 
+	def GetDistanceSensorHandles(self):
+		"""Resolve the optional robot-relative left, front and right proximity sensors."""
+		for direction, suffix in (('left', 'Left'), ('front', 'Front'), ('right', 'Right')):
+			alias = f'DistanceSensor{suffix}'
+			self.distanceSensorHandles[direction] = self._resolve_first_available(
+				[
+					f'/Robot/DistanceSensors/{alias}',
+					f'/Robot/{alias}',
+					f'/DistanceSensors/{alias}',
+					f'/{alias}',
+				],
+				alias,
+				required=False)
+
+		return 0 if all(handle is not None for handle in self.distanceSensorHandles.values()) else -1
+
 	# Get ZMQ bay handles for each shelf (legacy 2025 warehouse challenge; not used in this phase)
 	def getBayHandles(self):
 		"""Best-effort resolution of legacy shelf bay handles. Missing objects are expected in this phase."""
@@ -1191,7 +1173,7 @@ class COPPELIA_WarehouseRobot(object):
 		Builds the static EGB320 search and rescue maze scene.
 
 		Validates the maze configuration, clears any previously generated maze objects,
-		then generates the wall posts, internal walls and victims, and (optionally) places
+		then generates the wall posts, internal/perimeter walls and victims, and (optionally) places
 		the robot at its starting cell. Must be called while the simulation is stopped, since
 		it moves/scales/copies objects (this is done for us by StartSimulator).
 		"""
@@ -1216,9 +1198,15 @@ class COPPELIA_WarehouseRobot(object):
 		self._get_floor_info()
 		self._cache_template_geometry()
 
-		postCount = self._generate_wall_posts()
-		wallCount = self._generate_internal_walls()
-		victimCount = self._generate_victims()
+		if self.sceneParameters.generateMazeObjects:
+			postCount = self._generate_wall_posts()
+			wallCount = self._generate_internal_walls()
+			victimCount = self._generate_victims()
+		else:
+			print('generateMazeObjects is False - leaving the table clear for diagnostics.')
+			postCount = 0
+			wallCount = 0
+			victimCount = 0
 
 		self._park_templates_outside_playable_area()
 
@@ -1326,10 +1314,56 @@ class COPPELIA_WarehouseRobot(object):
 		Rz = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
 		return matmul3(matmul3(Rx, Ry), Rz)
 
+	def _get_wall_template_geometry(self, handle, name):
+		"""Return axis/orientation metadata needed to place and face a wall template."""
+		size = self._get_shape_bbox_size(handle)
+		orientation = self.sim.getObjectOrientation(handle, -1)
+		rotation = self._build_rotation_matrix(orientation)
+
+		worldZComponents = [abs(rotation[2][axis]) for axis in range(3)]
+		heightAxisIndex = worldZComponents.index(max(worldZComponents))
+		horizontalAxes = [axis for axis in range(3) if axis != heightAxisIndex]
+		lengthAxisIndex = max(horizontalAxes, key=lambda axis: size[axis])
+		thicknessAxisIndex = next(axis for axis in horizontalAxes if axis != lengthAxisIndex)
+
+		geometry = {
+			'name': name,
+			'handle': handle,
+			'size': size,
+			'orientation': orientation,
+			'heightAxisIndex': heightAxisIndex,
+			'lengthAxisIndex': lengthAxisIndex,
+			'thicknessAxisIndex': thicknessAxisIndex,
+			'worldHeight': size[heightAxisIndex],
+			'lengthAxisBaseYaw': math.atan2(rotation[1][lengthAxisIndex], rotation[0][lengthAxisIndex]),
+			# The decal textures are applied to the wall's thin local axis. Treat the local
+			# positive-thickness face as the marker face and rotate it toward the associated cell.
+			'markerFaceBaseYaw': math.atan2(rotation[1][thicknessAxisIndex], rotation[0][thicknessAxisIndex]),
+		}
+		return geometry
+
 	def _cache_template_geometry(self):
-		"""Cache template bounding boxes/orientations before templates are copied from or moved."""
-		self.mazeWallTemplateSize = self._get_shape_bbox_size(self.mazeWallTemplateHandle)
-		self.mazeWallTemplateOrientation = self.sim.getObjectOrientation(self.mazeWallTemplateHandle, -1)
+		"""Cache wall, post and victim template geometry before templates are moved."""
+		wallTemplates = {
+			'maze_wall': self.mazeWallTemplateHandle,
+			'base_station_wall': self.baseStationWallTemplateHandle,
+			'victim_wall': self.victimWallTemplateHandle,
+			'rubble_victim_wall': self.rubbleVictimWallTemplateHandle,
+			'hazard_wall': self.hazardWallTemplateHandle,
+		}
+		self.wallTemplateGeometry = {
+			handle: self._get_wall_template_geometry(handle, name)
+			for name, handle in wallTemplates.items()
+		}
+
+		mazeWallGeometry = self.wallTemplateGeometry[self.mazeWallTemplateHandle]
+		self.mazeWallTemplateSize = mazeWallGeometry['size']
+		self.mazeWallTemplateOrientation = mazeWallGeometry['orientation']
+		self.mazeWallHeightAxisIndex = mazeWallGeometry['heightAxisIndex']
+		self.mazeWallLengthAxisIndex = mazeWallGeometry['lengthAxisIndex']
+		self.mazeWallWorldHeight = mazeWallGeometry['worldHeight']
+		self.mazeWallLengthAxisBaseYaw = mazeWallGeometry['lengthAxisBaseYaw']
+
 		self.wallPostTemplateSize = self._get_shape_bbox_size(self.wallPostTemplateHandle)
 		self.wallPostTemplateOrientation = self.sim.getObjectOrientation(self.wallPostTemplateHandle, -1)
 		try:
@@ -1339,29 +1373,12 @@ class COPPELIA_WarehouseRobot(object):
 			self.victimTemplateSize = (0.0, 0.0, 0.0)
 		self.victimTemplateOrientation = self.sim.getObjectOrientation(self.victimTemplateHandle, -1)
 
-		# The maze_wall template's local X/Y/Z axes don't necessarily line up with "length/height
-		# /thickness" - e.g. it may be authored lying flat then rotated upright with a fixed roll.
-		# Find which local axis is vertical (under the template's own base orientation) so we scale
-		# and reorient the correct axis for each generated wall segment.
-		R = self._build_rotation_matrix(self.mazeWallTemplateOrientation)
-		worldZComponents = [abs(R[2][0]), abs(R[2][1]), abs(R[2][2])]
-		heightAxisIndex = worldZComponents.index(max(worldZComponents))
-		remainingAxes = [i for i in range(3) if i != heightAxisIndex]
-		if self.mazeWallTemplateSize[remainingAxes[0]] >= self.mazeWallTemplateSize[remainingAxes[1]]:
-			lengthAxisIndex = remainingAxes[0]
-		else:
-			lengthAxisIndex = remainingAxes[1]
-		self.mazeWallHeightAxisIndex = heightAxisIndex
-		self.mazeWallLengthAxisIndex = lengthAxisIndex
-		self.mazeWallWorldHeight = self.mazeWallTemplateSize[heightAxisIndex]
-		# World-frame yaw that the template's own length axis already points at, under its base
-		# orientation - needed so we rotate it by exactly the right extra amount for each segment.
-		self.mazeWallLengthAxisBaseYaw = math.atan2(R[1][lengthAxisIndex], R[0][lengthAxisIndex])
-
 		axisNames = ['X', 'Y', 'Z']
-		print(f"maze_wall template size (x,y,z): {self.mazeWallTemplateSize}, orientation: {self.mazeWallTemplateOrientation}")
-		print(f"maze_wall detected height axis: local {axisNames[heightAxisIndex]} ({self.mazeWallWorldHeight:.4f} m), "
-			  f"length axis: local {axisNames[lengthAxisIndex]} ({self.mazeWallTemplateSize[lengthAxisIndex]:.4f} m)")
+		for geometry in self.wallTemplateGeometry.values():
+			print(
+				f"{geometry['name']} template size: {geometry['size']}, "
+				f"height axis: local {axisNames[geometry['heightAxisIndex']]}, "
+				f"length axis: local {axisNames[geometry['lengthAxisIndex']]}")
 		print(f"wall_post template size (x,y,z): {self.wallPostTemplateSize}")
 		print(f"victim template size (x,y,z): {self.victimTemplateSize}")
 
@@ -1378,6 +1395,179 @@ class COPPELIA_WarehouseRobot(object):
 		x = self.mazeXMinimum + (column + 0.5) * cellSize
 		y = self.mazeYMaximum - (row + 0.5) * cellSize
 		return x, y
+
+	def _get_perimeter_wall_segments(self):
+		"""Return one wall segment for every cell edge around the complete maze border."""
+		columns = self.sceneParameters.mazeColumns
+		rows = self.sceneParameters.mazeRows
+		segments = []
+
+		# North and south borders.
+		for column in range(columns):
+			segments.append(((column, 0), (column + 1, 0)))
+			segments.append(((column, rows), (column + 1, rows)))
+
+		# West and east borders.
+		for row in range(rows):
+			segments.append(((0, row), (0, row + 1)))
+			segments.append(((columns, row), (columns, row + 1)))
+
+		return segments
+
+	@staticmethod
+	def _normalise_grid_segment(startPoint, endPoint):
+		"""Return a direction-independent key for a wall segment."""
+		return tuple(sorted((tuple(startPoint), tuple(endPoint))))
+
+	def _cell_side_segment(self, cell, side):
+		"""Return the grid segment forming one cardinal side of a cell."""
+		column, row = cell
+		segments = {
+			'N': ((column, row), (column + 1, row)),
+			'E': ((column + 1, row), (column + 1, row + 1)),
+			'S': ((column, row + 1), (column + 1, row + 1)),
+			'W': ((column, row), (column, row + 1)),
+		}
+		return segments[side]
+
+	def _cell_wall_sides(self, cell):
+		"""Return which N/E/S/W sides of a cell are closed by a wall or table boundary."""
+		column, row = cell
+		axisAlignedWalls = {
+			self._normalise_grid_segment(startPoint, endPoint)
+			for startPoint, endPoint in EXAMPLE_MAZE_SEGMENTS
+			if startPoint[0] == endPoint[0] or startPoint[1] == endPoint[1]
+		}
+		boundarySides = {
+			'N': row == 0,
+			'E': column == self.sceneParameters.mazeColumns - 1,
+			'S': row == self.sceneParameters.mazeRows - 1,
+			'W': column == 0,
+		}
+		return {
+			side: boundarySides[side] or self._normalise_grid_segment(*self._cell_side_segment(cell, side)) in axisAlignedWalls
+			for side in ('N', 'E', 'S', 'W')
+		}
+
+	def _shortest_path_entry_directions(self):
+		"""Return the movement direction used to first enter each cell from the base cell."""
+		directionSteps = {
+			'N': (0, -1),
+			'E': (1, 0),
+			'S': (0, 1),
+			'W': (-1, 0),
+		}
+		baseCell = tuple(self.sceneParameters.baseCell)
+		queue = deque([baseCell])
+		visited = {baseCell}
+		entryDirections = {}
+
+		while queue:
+			cell = queue.popleft()
+			wallSides = self._cell_wall_sides(cell)
+			for direction, (columnStep, rowStep) in directionSteps.items():
+				if wallSides[direction]:
+					continue
+				neighbour = (cell[0] + columnStep, cell[1] + rowStep)
+				if neighbour in visited:
+					continue
+				visited.add(neighbour)
+				entryDirections[neighbour] = direction
+				queue.append(neighbour)
+
+		return entryDirections
+
+	def _plan_marker_walls(self):
+		"""
+		Choose marker-bearing wall segments for the base, victims and empty dead ends.
+
+		Internal marker walls replace the ordinary wall on the same segment. Marker walls on
+		the outer maze boundary are added as one-cell liners immediately inside the table wall.
+		"""
+		oppositeDirection = {'N': 'S', 'E': 'W', 'S': 'N', 'W': 'E'}
+		assignments = {}
+
+		def assign(kind, cell, side, templateHandle, alias, label=None):
+			wallSides = self._cell_wall_sides(cell)
+			if not wallSides[side]:
+				raise ValueError(f"Cannot place {kind} marker at cell {cell}: side {side} is open")
+			startPoint, endPoint = self._cell_side_segment(cell, side)
+			segmentKey = self._normalise_grid_segment(startPoint, endPoint)
+			if segmentKey in assignments:
+				raise ValueError(
+					f"Marker wall conflict on segment {segmentKey}: "
+					f"{assignments[segmentKey]['kind']} and {kind}")
+			assignments[segmentKey] = {
+				'kind': kind,
+				'cell': tuple(cell),
+				'side': side,
+				'templateHandle': templateHandle,
+				'alias': alias,
+				'label': label,
+				'startPoint': startPoint,
+				'endPoint': endPoint,
+			}
+
+		# The base is a three-sided corner cell in the approved maze. Put its marker on the
+		# back wall opposite the only opening so it faces the normal return approach.
+		baseCell = tuple(self.sceneParameters.baseCell)
+		baseWalls = self._cell_wall_sides(baseCell)
+		baseOpenSides = [side for side, closed in baseWalls.items() if not closed]
+		if len(baseOpenSides) == 1:
+			baseMarkerSide = oppositeDirection[baseOpenSides[0]]
+		else:
+			baseBoundarySides = [
+				side for side in ('S', 'W', 'N', 'E')
+				if baseWalls[side] and (
+					(side == 'N' and baseCell[1] == 0) or
+					(side == 'E' and baseCell[0] == self.sceneParameters.mazeColumns - 1) or
+					(side == 'S' and baseCell[1] == self.sceneParameters.mazeRows - 1) or
+					(side == 'W' and baseCell[0] == 0))
+			]
+			if not baseBoundarySides:
+				raise ValueError(f"Base cell {baseCell} has no suitable wall for the base marker")
+			baseMarkerSide = baseBoundarySides[0]
+		assign('base', baseCell, baseMarkerSide, self.baseStationWallTemplateHandle, 'EGB320_GEN_BASE_STATION_WALL')
+
+		# Prefer a wall directly ahead on the shortest route from base. If that side is open
+		# (e.g. a victim in a through corridor), use a deterministic existing side wall.
+		entryDirections = self._shortest_path_entry_directions()
+		victimCells = {tuple(cell) for cell in self.sceneParameters.victimCells.values()}
+		for label, configuredCell in self.sceneParameters.victimCells.items():
+			cell = tuple(configuredCell)
+			wallSides = self._cell_wall_sides(cell)
+			approachDirection = entryDirections.get(cell)
+			candidateSides = []
+			for side in (approachDirection, 'E', 'W', 'S', 'N'):
+				if side is not None and side not in candidateSides:
+					candidateSides.append(side)
+			markerSide = next((side for side in candidateSides if wallSides[side]), None)
+			if markerSide is None:
+				raise ValueError(f"Victim '{label}' at cell {cell} has no wall for its marker")
+
+			isLevel3 = str(label).upper() == 'L3'
+			templateHandle = self.rubbleVictimWallTemplateHandle if isLevel3 else self.victimWallTemplateHandle
+			kind = 'rubble_victim' if isLevel3 else 'victim'
+			safeLabel = ''.join(character if character.isalnum() else '_' for character in str(label).upper())
+			assign(kind, cell, markerSide, templateHandle, f'EGB320_GEN_{kind.upper()}_WALL_{safeLabel}', label=str(label))
+
+		# Every remaining three-sided cell is a hazard dead end. Its marker goes on the back
+		# wall opposite the opening, and the base/victim cells are explicitly excluded.
+		for row in range(self.sceneParameters.mazeRows):
+			for column in range(self.sceneParameters.mazeColumns):
+				cell = (column, row)
+				if cell == baseCell or cell in victimCells:
+					continue
+				wallSides = self._cell_wall_sides(cell)
+				openSides = [side for side, closed in wallSides.items() if not closed]
+				if len(openSides) != 1:
+					continue
+				hazardSide = oppositeDirection[openSides[0]]
+				assign(
+					'hazard', cell, hazardSide, self.hazardWallTemplateHandle,
+					f'EGB320_GEN_HAZARD_WALL_C{column}_R{row}')
+
+		return assignments
 
 	def _generate_wall_posts(self):
 		"""Create one /wall_post copy at every grid intersection: (mazeRows+1) x (mazeColumns+1) posts."""
@@ -1396,13 +1586,71 @@ class COPPELIA_WarehouseRobot(object):
 				count += 1
 		return count
 
-	def _create_wall_between_grid_points(self, startPoint, endPoint, index):
+	def _copy_and_scale_wall_template(self, templateHandle, geometry, scaleFactor, copyWholeModel=False):
+		"""Copy a wall template and scale every copied shape along the wall-length direction."""
+		copyOptions = 1 if copyWholeModel else 0
+		try:
+			newHandle = self.sim.copyPasteObjects([templateHandle], copyOptions)[0]
+		except Exception as e:
+			if copyWholeModel:
+				raise RuntimeError(
+					f"Could not copy the complete {geometry['name']} model. Ensure its root has "
+					"'Object is model' enabled and the marker is parented beneath it."
+				) from e
+			raise
+
+		if copyWholeModel:
+			# Whole-model copying preserves the marker child. Scale every shape in the copied
+			# hierarchy so the wall and decal remain the same width. Determine each shape's
+			# local length axis from its world orientation, which also supports a flipped decal.
+			shapeHandles = self.sim.getObjectsInTree(newHandle, self.sim.sceneobject_shape, 0)
+			if len(shapeHandles) < 2:
+				try:
+					self.sim.removeModel(newHandle)
+				except Exception:
+					self.sim.removeObject(newHandle)
+				raise RuntimeError(
+					f"The copied {geometry['name']} model does not contain a marker child shape."
+				)
+
+			rootRotation = self._build_rotation_matrix(geometry['orientation'])
+			lengthDirection = [
+				rootRotation[row][geometry['lengthAxisIndex']]
+				for row in range(3)
+			]
+		else:
+			shapeHandles = [newHandle]
+			lengthDirection = None
+
+		for shapeHandle in shapeHandles:
+			if lengthDirection is None:
+				lengthAxisIndex = geometry['lengthAxisIndex']
+			else:
+				shapeOrientation = self.sim.getObjectOrientation(shapeHandle, -1)
+				shapeRotation = self._build_rotation_matrix(shapeOrientation)
+				axisAlignment = [
+					abs(sum(shapeRotation[row][axis] * lengthDirection[row] for row in range(3)))
+					for axis in range(3)
+				]
+				lengthAxisIndex = axisAlignment.index(max(axisAlignment))
+
+			scaleXYZ = [1.0, 1.0, 1.0]
+			scaleXYZ[lengthAxisIndex] = scaleFactor
+			self.sim.scaleObject(shapeHandle, scaleXYZ[0], scaleXYZ[1], scaleXYZ[2], 0)
+
+		return newHandle
+
+	def _create_wall_between_grid_points(self, startPoint, endPoint, index, templateHandle=None, alias=None, markerCell=None):
 		"""
-		Create a single maze_wall copy spanning the given grid intersections.
+		Create a wall-template copy spanning the given grid intersections.
 		Scales only the template's long axis to match the segment length, and orients the
-		wall so that axis lies along the segment - this supports horizontal, vertical and
-		diagonal walls with a single code path.
+		wall so that axis lies along the segment. For marker walls, markerCell identifies
+		the associated cell and the decal face is rotated inward toward that cell.
 		"""
+		if templateHandle is None:
+			templateHandle = self.mazeWallTemplateHandle
+		geometry = self.wallTemplateGeometry[templateHandle]
+
 		x1, y1 = self._grid_point_to_world(*startPoint)
 		x2, y2 = self._grid_point_to_world(*endPoint)
 
@@ -1415,39 +1663,93 @@ class COPPELIA_WarehouseRobot(object):
 		segmentYaw = math.atan2(dy, dx)
 		midX = (x1 + x2) / 2.0
 		midY = (y1 + y2) / 2.0
-		zPos = self.floorTopZ + self.mazeWallWorldHeight / 2.0
+		zPos = self.floorTopZ + geometry['worldHeight'] / 2.0
 
-		newHandle = self.sim.copyPasteObjects([self.mazeWallTemplateHandle], 0)[0]
-
-		scaleFactor = length / self.mazeWallTemplateSize[self.mazeWallLengthAxisIndex]
-		scaleXYZ = [1.0, 1.0, 1.0]
-		scaleXYZ[self.mazeWallLengthAxisIndex] = scaleFactor
-		self.sim.scaleObject(newHandle, scaleXYZ[0], scaleXYZ[1], scaleXYZ[2], 0)
+		scaleFactor = length / geometry['size'][geometry['lengthAxisIndex']]
+		newHandle = self._copy_and_scale_wall_template(
+			templateHandle,
+			geometry,
+			scaleFactor,
+			copyWholeModel=markerCell is not None)
 
 		# Compose the extra yaw needed with the template's own natural tilt via a temporary
 		# reference dummy, rather than hand-rolling Euler/matrix composition: setting an
 		# object's position/orientation "relative to" another handle works regardless of
 		# actual parent-child hierarchy, so no reparenting is required.
-		deltaYaw = segmentYaw - self.mazeWallLengthAxisBaseYaw
+		deltaYaw = segmentYaw - geometry['lengthAxisBaseYaw']
+		if markerCell is not None:
+			cellX, cellY = self._cell_center_to_world(*markerCell)
+			desiredFaceYaw = math.atan2(cellY - midY, cellX - midX)
+			placedFaceYaw = geometry['markerFaceBaseYaw'] + deltaYaw
+			if math.cos(placedFaceYaw - desiredFaceYaw) < 0:
+				deltaYaw += math.pi
+
 		helperDummy = self.sim.createDummy(0.01)
 		self.sim.setObjectPosition(helperDummy, -1, [midX, midY, zPos])
 		self.sim.setObjectOrientation(helperDummy, -1, [0, 0, deltaYaw])
 		self.sim.setObjectPosition(newHandle, helperDummy, [0, 0, 0])
-		self.sim.setObjectOrientation(newHandle, helperDummy, list(self.mazeWallTemplateOrientation))
+		self.sim.setObjectOrientation(newHandle, helperDummy, list(geometry['orientation']))
 		self.sim.removeObject(helperDummy)
 
-		self.sim.setObjectAlias(newHandle, f"EGB320_GEN_WALL_{index:03d}")
+		if alias is None:
+			alias = f"EGB320_GEN_WALL_{index:03d}"
+		self.sim.setObjectAlias(newHandle, alias)
 		self.sim.setObjectParent(newHandle, self.generatedSceneRootHandle, True)
 
 		self.generatedMazeWallHandles.append(newHandle)
+		if markerCell is not None:
+			self.generatedMarkerWallHandles.append(newHandle)
 		return newHandle
 
 	def _generate_internal_walls(self):
-		"""Create one maze_wall copy for every segment in EXAMPLE_MAZE_SEGMENTS (40 walls)."""
+		"""Create all internal/perimeter walls, substituting marker walls where required."""
+		markerAssignments = self._plan_marker_walls()
+		self.markerWallPlacements = []
+		wallSegments = list(EXAMPLE_MAZE_SEGMENTS)
+		seenSegments = {
+			self._normalise_grid_segment(startPoint, endPoint)
+			for startPoint, endPoint in wallSegments
+		}
+		for startPoint, endPoint in self._get_perimeter_wall_segments():
+			segmentKey = self._normalise_grid_segment(startPoint, endPoint)
+			if segmentKey not in seenSegments:
+				wallSegments.append((startPoint, endPoint))
+				seenSegments.add(segmentKey)
+
 		count = 0
-		for index, (startPoint, endPoint) in enumerate(EXAMPLE_MAZE_SEGMENTS):
-			self._create_wall_between_grid_points(startPoint, endPoint, index)
+		for index, (startPoint, endPoint) in enumerate(wallSegments):
+			segmentKey = self._normalise_grid_segment(startPoint, endPoint)
+			marker = markerAssignments.pop(segmentKey, None)
+			if marker is None:
+				self._create_wall_between_grid_points(startPoint, endPoint, index)
+			else:
+				self._create_wall_between_grid_points(
+					startPoint,
+					endPoint,
+					index,
+					templateHandle=marker['templateHandle'],
+					alias=marker['alias'],
+					markerCell=marker['cell'])
+				self.markerWallPlacements.append(marker)
 			count += 1
+
+		# Defensive fallback for any marker assigned to an unexpected wall segment that is not
+		# present in the configured internal or generated perimeter wall lists.
+		for marker in markerAssignments.values():
+			self._create_wall_between_grid_points(
+				marker['startPoint'],
+				marker['endPoint'],
+				count,
+				templateHandle=marker['templateHandle'],
+				alias=marker['alias'],
+				markerCell=marker['cell'])
+			self.markerWallPlacements.append(marker)
+			count += 1
+
+		for marker in self.markerWallPlacements:
+			print(
+				f"Marker wall: {marker['kind']} at cell {marker['cell']} "
+				f"on side {marker['side']} ({marker['alias']})")
 		return count
 
 	def _generate_victims(self):
@@ -1470,11 +1772,15 @@ class COPPELIA_WarehouseRobot(object):
 		return count
 
 	def _park_templates_outside_playable_area(self):
-		"""Move the maze_wall, wall_post and victim templates outside the playable area (kept for future regeneration)."""
+		"""Move all source templates outside the playable area for future regeneration."""
 		parkingSpots = {
 			self.mazeWallTemplateHandle: (-3.0, -3.0),
-			self.wallPostTemplateHandle: (-3.0, -3.5),
-			self.victimTemplateHandle: (-3.0, -4.0),
+			self.baseStationWallTemplateHandle: (-3.0, -3.4),
+			self.victimWallTemplateHandle: (-3.0, -3.8),
+			self.rubbleVictimWallTemplateHandle: (-3.0, -4.2),
+			self.hazardWallTemplateHandle: (-3.0, -4.6),
+			self.wallPostTemplateHandle: (-3.4, -3.0),
+			self.victimTemplateHandle: (-3.4, -3.4),
 		}
 		for handle, (parkX, parkY) in parkingSpots.items():
 			try:
@@ -1494,6 +1800,14 @@ class COPPELIA_WarehouseRobot(object):
 				self.sim.resetDynamicObject(self.robotHandle)
 			except Exception:
 				pass
+			# Zero any residual motor target velocity so a stale command from a previous
+			# run/session can't start driving the wheels the instant the simulation starts.
+			for motorHandle in (self.leftMotorHandle, self.rightMotorHandle, self.leftRearMotorHandle, self.rightRearMotorHandle):
+				if motorHandle is not None:
+					try:
+						self.sim.setJointTargetVelocity(motorHandle, 0.0)
+					except Exception:
+						pass
 			print(f"Robot placed at ({x:.4f}, {y:.4f}) with yaw {theta:.4f} rad")
 		except Exception as e:
 			print(f"Warning: could not set robot starting pose: {e}")
@@ -1568,14 +1882,21 @@ class COPPELIA_WarehouseRobot(object):
 			except Exception as e:
 				print(f"Warning: could not enumerate previous generated objects: {e}")
 				childHandles = []
-			for childHandle in childHandles:
-				if childHandle == rootHandle:
-					continue
+			generatedHandles = [handle for handle in childHandles if handle != rootHandle]
+			if generatedHandles:
 				try:
-					self.sim.removeObject(childHandle)
-					removedCount += 1
+					# Remove the hierarchy in one operation so marker children are removed together
+					# with their model-base walls and cannot be orphaned between regenerations.
+					self.sim.removeObjects(generatedHandles)
+					removedCount += len(generatedHandles)
 				except Exception:
-					pass
+					# Compatibility fallback for older CoppeliaSim releases.
+					for childHandle in reversed(generatedHandles):
+						try:
+							self.sim.removeObject(childHandle)
+							removedCount += 1
+						except Exception:
+							pass
 			try:
 				self.sim.removeObject(rootHandle)
 				removedCount += 1
@@ -1588,9 +1909,11 @@ class COPPELIA_WarehouseRobot(object):
 		self._ensure_generated_scene_root()
 
 		self.generatedMazeWallHandles = []
+		self.generatedMarkerWallHandles = []
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
+		self.markerWallPlacements = []
 
 		print(f"Cleanup removed {removedCount} previously generated object(s).")
 		return removedCount
@@ -1606,7 +1929,15 @@ class COPPELIA_WarehouseRobot(object):
 		print(f"Cell size: {self.sceneParameters.mazeCellSize:.3f} m")
 		print(f"Maze footprint: {mazeWidth:.3f} m x {mazeHeight:.3f} m")
 		print(f"Posts created: {postCount}")
-		print(f"Internal walls created: {wallCount}")
+		print(f"Walls created: {wallCount}")
+		markerCounts = {
+			kind: sum(1 for marker in self.markerWallPlacements if marker['kind'] == kind)
+			for kind in ('base', 'victim', 'rubble_victim', 'hazard')
+		}
+		print(
+			"Marker walls created: "
+			f"base={markerCounts['base']}, exposed victims={markerCounts['victim']}, "
+			f"trapped victims={markerCounts['rubble_victim']}, hazards={markerCounts['hazard']}")
 		print(f"Victims created: {victimCount}")
 		print(f"Base cell: {tuple(self.sceneParameters.baseCell)}")
 		print(f"Victim cells: {victimCellsText}")
@@ -1924,6 +2255,8 @@ class COPPELIA_WarehouseRobot(object):
 					self.itemConnectedToRobot = False
 
 	
+	# Legacy 2025 boundary-only wall geometry. Retained internally as a possible reference for
+	# a future maze-aware replacement, but deliberately not called by GetDetectedWallPoints().
 	# Gets the range and bearing to a corner that is within the camera's field of view.
 	# Will only return a single corner, as only one corner can be in the field of view with the current setup.
 	# returns:
@@ -2222,6 +2555,7 @@ class RobotParameters(object):
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m
 		self.maxRowMarkerDetectionDistance = 2.5  # max distance to detect row markers in m
 		self.maxShelfDetectionDistance = 2.0     # max distance to detect shelves in m
+		self.minWallDetectionDistance = 0.02      # min distance for a wall point to be considered valid, in m
 		
 		# Collector Parameters
 		self.collectorQuality = 1.0      # collector quality from 0 to 1
@@ -2246,6 +2580,9 @@ class SceneParameters(object):
 		self.mazeOriginXY = None   # None = use the centre of /floor as the maze origin
 		self.autoGenerateMaze = True
 		self.clearGeneratedMaze = True
+		# False clears previously generated objects but creates no posts, walls or victims.
+		# The templates are still parked off-table and the robot is placed normally.
+		self.generateMazeObjects = True
 		self.baseCell = (0, 6)
 		self.baseYaw = math.pi / 2
 		self.victimCells = {
