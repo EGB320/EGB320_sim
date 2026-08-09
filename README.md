@@ -236,86 +236,68 @@ else:
 
 ---
 
-### Item Collection and Delivery
+### Victim Collection
 
-#### `CollectItem(closest_picking_station=False)`
+#### `CollectVictim()`
 
-Attempts to collect items from picking stations.
+Attempts to collect the nearest generated victim. The library calculates the shortest
+horizontal distance between the victim and the complete robot model only when this method
+is called. Collection succeeds when that clearance is at most
+`robotParameters.victimCollectionDistance` (0.10 m by default) and the robot is not already
+carrying a victim.
 
-**Parameters:**
-- `closest_picking_station` (bool, optional): If True, collects from the closest picking station. Default: False
+On success, the victim is made static/non-respondable and attached to
+`/Robot/VictimCarryPoint`. The dummy controls where the victim appears on the robot. The
+victim's long axis is rotated horizontally so it can be carried above the robot without
+standing in front of the camera.
 
 **Returns:**
-- `tuple`: (success, station_number)
-  - `success` (bool): True if item was collected successfully
-  - `station_number` (int): Station number (1-3) where item was collected, or None if failed
+- `tuple`: (success, victim_label, distance)
+  - `success` (bool): True if a victim was collected successfully
+  - `victim_label` (str): `L1`, `L2`, or `L3` after success; otherwise `None`
+  - `distance` (float): Successful collection clearance in metres; otherwise `None`
 
 **Example:**
 ```python
-# Try to collect from closest picking station
-success, station = robot.CollectItem(closest_picking_station=True)
+success, victim_label, distance = robot.CollectVictim()
 if success:
-    print(f"Collected item from station {station}")
+    print(f"Collected victim {victim_label} at {distance:.3f} m")
 else:
-    print("Failed to collect item")
+    print("No victim was collected")
 ```
 
 ---
-#### `DropItem()`
+#### `HasVictim()`
 
-Drops the currently held item at the robot's current location.
-
-**Returns:** None
-
-**Example:**
-```python
-if robot.itemCollected():
-    robot.DropItem()
-    print("Item dropped")
-```
-
----
-
-#### `DropItemInClosestShelfBay(max_drop_distance=0.5)`
-
-Drops an item in the closest empty shelf bay.
-
-**Parameters:**
-- `max_drop_distance` (float, optional): Maximum distance to consider a shelf bay. Default: 0.5 meters
+Checks if the robot is currently carrying a victim.
 
 **Returns:**
-- `tuple`: (success, shelf_info)
-  - `success` (bool): True if item was dropped successfully
-  - `shelf_info` (dict): Dictionary with shelf information, or None if failed
-    - `shelf` (int): Shelf number (0-5)
-    - `x` (int): X position in shelf (0-3)
-    - `y` (int): Y position in shelf (0-2)
-    - `distance` (float): Distance to shelf bay
+- `bool`: True if the robot is carrying a victim, otherwise False
 
 **Example:**
 ```python
-if robot.itemCollected():
-    success, shelf_info = robot.DropItemInClosestShelfBay()
-    if success:
-        shelf = shelf_info['shelf']
-        print(f"Item dropped at shelf {shelf}")
+if robot.HasVictim():
+    print("Robot is carrying a victim")
 ```
 
 ---
 
-#### `itemCollected()`
+#### `ReleaseVictim()`
 
-Checks if the robot is currently carrying an item.
+Places the carried victim back onto the maze floor, 0.15 m in front of the robot. The
+victim's floor orientation is restored and its lowest bounding-box point is placed 1 mm
+above the floor.
 
 **Returns:**
-- `bool`: True if robot is carrying an item, False otherwise
+
+- `tuple`: (success, victim_label)
+  - `success` (bool): True if the victim was released successfully
+  - `victim_label` (str): The released victim label, or `None` on failure
 
 **Example:**
 ```python
-if robot.itemCollected():
-    print("Robot is carrying an item")
-    # Try to drop it at a shelf
-    robot.DropItemInClosestShelfBay()
+if robot.HasVictim():
+    success, victim_label = robot.ReleaseVictim()
 ```
 
 ---

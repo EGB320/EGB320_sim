@@ -14,9 +14,7 @@ This library provides a Python interface for controlling the EGB320 robot in Cop
 
 As of this phase, the library targets the 2026 search and rescue maze challenge. It uses
 the CoppeliaSim ZeroMQ Python remote API to deterministically generate a 7x7 cell maze
-(walls, corner posts) and place three victim objects. The legacy 2025 warehouse pick and
-place functions (picking stations, shelves, items, obstacles, row markers) are retained for
-backward compatibility but are optional and are not required for this phase.
+(walls, corner posts) and place three victim objects.
 
 MAIN FUNCTIONS:
 ===========================
@@ -31,11 +29,10 @@ Object Detection:
 - GetCameraImage()                      : Get camera image for computer vision
 - GetWallDistances()                    : Get robot-relative left/front/right proximity readings
 
-Legacy Item Collection (2025 warehouse challenge, unused in this phase):
-- CollectItem(closest_picking_station)  : Collect items from picking stations
-- DropItemInClosestShelfBay()          : Drop items in nearest empty shelf bay
-- itemCollected()                       : Check if robot is carrying an item
-- DropItem()                           : Drop the currently held item
+Victim Collection:
+- CollectVictim()                       : Attempt to collect a victim within 0.10 m
+- ReleaseVictim()                       : Place the carried victim on the ground
+- HasVictim()                           : Check whether the robot is carrying a victim
 
 Configuration:
 - SetCameraResolution(x_res, y_res)    : Set camera resolution
@@ -123,6 +120,11 @@ EXAMPLE_MAZE_SEGMENTS = [
 	((3, 6), (3, 7)),
 ]
 
+# Small separation used when placing a victim on either the maze floor or robot chassis.
+VICTIM_SURFACE_CLEARANCE = 0.001
+VICTIM_CARRY_ORIENTATION = (0.0, math.pi / 2.0, 0.0)
+VICTIM_RELEASE_FORWARD_OFFSET = 0.15
+
 
 
 # Object types retained for the search-and-rescue challenge.
@@ -181,7 +183,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.scriptHandle = None
 		self.cameraHandle = None
 		self.objectDetectorHandle = None
-		self.collectorForceSensorHandle = None
+		self.victimCarryPointHandle = None
 		self.leftMotorHandle = None
 		self.rightMotorHandle = None
 		self.leftRearMotorHandle = None
@@ -224,6 +226,8 @@ class COPPELIA_WarehouseRobot(object):
 		self.victimHandles = {}
 		self.victimPositions = {}
 		self.markerWallPlacements = []
+		self.carriedVictimHandle = None
+		self.carriedVictimLabel = None
 
 		# Cached maze geometry (populated by _get_floor_info/_cache_template_geometry)
 		self.floorCenter = None
@@ -256,10 +260,6 @@ class COPPELIA_WarehouseRobot(object):
 		self.pickingStationPosition = None
 		self.obstaclePositions = [None, None, None]
 		self.rowMarkerPositions = [None, None, None]
-
-		# Item collection state
-		self.itemConnectedToRobot = False
-		self.heldItemHandle = None
 
 		# Connect to CoppeliaSim
 		print("Connecting to CoppeliaSim...")
@@ -560,236 +560,163 @@ class COPPELIA_WarehouseRobot(object):
 		elif self.robotParameters.driveType == 'holonomic':
 			print('Holonomic drive not yet implemented')
 
-	def itemCollected(self):
-		"""
-		Returns True if the robot is currently carrying an item.
-		
-		Returns:
-			bool: True if item is collected, False otherwise
-		"""
-		return self.itemConnectedToRobot
+	def HasVictim(self):
+		"""Return True when a victim is currently attached to VictimCarryPoint."""
+		return self.carriedVictimHandle is not None
 
-	def DropItem(self):
-		"""
-		Drops the currently held item.
-		"""
-		if self.itemConnectedToRobot:
-			try:
-				if hasattr(self, 'heldItemHandle') and self.heldItemHandle is not None:
-					objectHandle = self.heldItemHandle
-					
-					if objectHandle != -1:
-						try:
-							# Verify handle is still valid
-							self.sim.getObjectPosition(objectHandle, -1)
-							
-							# Release the item from the robot
-							self.sim.setObjectParent(objectHandle, -1, True)
-							
-							print(f"Released item with handle: {objectHandle}")
-							self.heldItemHandle = None
-							self.itemConnectedToRobot = False
-							
-						except Exception as e:
-							print(f"Error releasing item: {e}")
-							self.heldItemHandle = None
-							self.itemConnectedToRobot = False
-					else:
-						print("Error: Invalid item handle during release")
-						self.heldItemHandle = None
-						self.itemConnectedToRobot = False
-				else:
-					print("No items to release")
-					self.itemConnectedToRobot = False
-					
-			except Exception as e:
-				print(f"Error during item release: {e}")
-				self.itemConnectedToRobot = False
+	def _get_horizontal_robot_to_victim_distance(self, victimHandle, robotCollectionHandle):
+		"""Return the shortest horizontal clearance between the robot model and one victim."""
+		result, distanceData, _objectPair = self.sim.checkDistance(
+			robotCollectionHandle, victimHandle, 0.0)
+		if result <= 0 or distanceData is None or len(distanceData) < 7:
+			return None
+		return math.hypot(
+			distanceData[3] - distanceData[0],
+			distanceData[4] - distanceData[1])
 
-	def JoinRobotAndItem(self, item_handle):
-		"""
-		Attaches an item to the robot for collection.
-		
-		Args:
-			item_handle: Handle of the item to collect
-			
-		Returns:
-			bool: True if successful, False otherwise
-		"""
+	def _attach_victim_to_carry_point(self, victimHandle):
+		"""Attach a victim at the carry dummy and lay its long axis horizontally."""
+		originalParent = self.sim.getObjectParent(victimHandle)
+		originalPosition = self.sim.getObjectPosition(victimHandle, -1)
+		originalOrientation = self.sim.getObjectOrientation(victimHandle, -1)
+
 		try:
-			if item_handle == -1:
-				print("Invalid item handle")
-				return False
-				
-			# Verify the handle is valid
-			try:
-				self.sim.getObjectPosition(item_handle, -1)
-			except Exception:
-				print(f"Invalid object handle: {item_handle}")
-				return False
-			
-			# Attach item to robot
-			self.sim.setObjectPosition(item_handle, self.robotHandle, [0.13, 0, -0.06])
-			self.sim.setObjectParent(item_handle, self.robotHandle, True)
-			
-			# Store the item handle
-			self.heldItemHandle = item_handle
-			
-			print(f"Collected item with handle: {item_handle}")
+			# Generated victims are static/non-respondable already. Re-apply those properties
+			# defensively so the carried visual does not disturb the robot's dynamics.
+			for shapeHandle in self.sim.getObjectsInTree(victimHandle, self.sim.object_shape_type, 0):
+				self.sim.setObjectInt32Param(shapeHandle, self.sim.shapeintparam_static, 1)
+				self.sim.setObjectInt32Param(shapeHandle, self.sim.shapeintparam_respondable, 0)
+
+			self.sim.setObjectParent(victimHandle, self.victimCarryPointHandle, True)
+			self.sim.setObjectPosition(victimHandle, self.victimCarryPointHandle, [0.0, 0.0, 0.0])
+			self.sim.setObjectOrientation(
+				victimHandle, self.victimCarryPointHandle, list(VICTIM_CARRY_ORIENTATION))
 			return True
-			
 		except Exception as e:
-			print(f"Error collecting item: {e}")
+			# Restore the victim if any part of the attachment operation failed.
+			try:
+				self.sim.setObjectParent(victimHandle, originalParent, True)
+				self.sim.setObjectPosition(victimHandle, -1, originalPosition)
+				self.sim.setObjectOrientation(victimHandle, -1, originalOrientation)
+			except Exception:
+				pass
+			print(f"Error attaching victim to VictimCarryPoint: {e}")
 			return False
 
-	def CollectItem(self, closest_picking_station=False):
+	def CollectVictim(self):
 		"""
-		Attempts to collect items from picking stations.
-		
-		Args:
-			closest_picking_station: If True, collects from the closest picking station
-			
+		Attempt to collect the closest generated victim within the permitted distance.
+
+		The distance test is performed only when this function is called. It uses the
+		shortest horizontal distance between any shape in the robot model and the victim,
+		matching the assessment's 0.10 m collection rule. Only one victim can be carried.
+
 		Returns:
-			tuple: (success, station_number) where:
-				- success: True if item was collected
-				- station_number: Which station the item was collected from (1-3), or None if failed
+			tuple: (success, victim_label, distance) where victim_label and distance are
+			None when no victim was collected. Distance is in metres and is reported only
+			after a successful collection, so this API cannot be used as a victim sensor.
 		"""
-		if closest_picking_station:
-			closest_distance = float('inf')
-			closest_station = None
-			closest_handle = None
-			
-			# Find the closest item at picking stations
-			for station_index in range(3):
-				item_handle = self.pickingStationItemHandles[station_index]
-				
-				if item_handle is not None:
-					try:
-						item_position = self.sim.getObjectPosition(item_handle, self.collectorForceSensorHandle)
-						distance = math.sqrt(sum(pos**2 for pos in item_position))
+		if self.HasVictim():
+			print(f"Collection failed: already carrying victim {self.carriedVictimLabel}.")
+			return False, None, None
 
-						if distance < closest_distance:
-							closest_distance = distance
-							closest_station = station_index
-							closest_handle = item_handle
-							
-					except Exception:
-						self.pickingStationItemHandles[station_index] = None
-			
-			# Attempt to collect the closest item
-			if closest_station is not None and closest_distance < self.robotParameters.maxCollectDistance:
-				if not self.itemConnectedToRobot:
-					if self.JoinRobotAndItem(closest_handle):
-						self.itemConnectedToRobot = True
-						self.pickingStationItemHandles[closest_station] = None
-						print(f"Collected item from picking station {closest_station + 1}! (Distance: {closest_distance:.3f}m)")
-						return True, closest_station + 1
-					else:
-						print(f"Error collecting item from picking station {closest_station + 1}")
-						return False, None
-				else:
-					print("Robot already carrying an item")
-					return False, None
-			else:
-				if closest_station is not None:
-					print(f"Closest item is too far away ({closest_distance:.3f}m > {self.robotParameters.maxCollectDistance:.3f}m)")
-				else:
-					print("No items found at any picking stations")
-				return False, None
+		if self.victimCarryPointHandle is None:
+			print("Collection failed: '/Robot/VictimCarryPoint' was not found in the robot model.")
+			return False, None, None
 
-		# Default behavior: try to collect from any nearby picking station
-		for station_index in range(3):
-			item_handle = self.pickingStationItemHandles[station_index]
-			
-			if item_handle is not None:
-				try:
-					item_position = self.sim.getObjectPosition(item_handle, self.collectorForceSensorHandle)
-					distance = math.sqrt(sum(pos**2 for pos in item_position))
-					
-					if distance < self.robotParameters.maxCollectDistance and not self.itemConnectedToRobot:
-						if self.JoinRobotAndItem(item_handle):
-							self.itemConnectedToRobot = True
-							self.pickingStationItemHandles[station_index] = None
-							print(f"Collected item from picking station {station_index + 1}! (Distance: {distance:.3f}m)")
-							return True, station_index + 1
-						else:
-							print(f"Error collecting item from picking station {station_index + 1}")
-							return False, None
-				except Exception:
-					self.pickingStationItemHandles[station_index] = None
-		
-		return False, None
+		if not self.victimHandles:
+			print("Collection failed: there are no generated victims in the scene.")
+			return False, None, None
 
-	def GetItemBayHeight(self, itemPosition):
-		"""Helper function to determine which shelf height level an item is at."""
-		if itemPosition[2] < 0.1:
-			return 0
-		elif itemPosition[2] < 0.2:
-			return 1
-		else:
-			return 2
-
-	def DropItemInClosestShelfBay(self, max_drop_distance=0.5):
-		"""
-		Drops an item in the closest empty shelf bay.
-		
-		Args:
-			max_drop_distance: Maximum distance to consider a shelf bay for dropping (in meters)
-			
-		Returns:
-			tuple: (success, shelf_info) where:
-				- success: True if item was dropped successfully
-				- shelf_info: Dictionary with shelf information, or None if failed
-		"""
-		if not self.itemConnectedToRobot:
-			print("No item to drop")
-			return False, None
-			
-		if self.robotPose is None:
-			print("Robot position unknown")
-			return False, None
-			
-		closest_bay = None
-		min_distance = float('inf')
-		
-		# Check all shelf bays to find the closest empty one
-		for shelf in range(6):
-			for x in range(4):
-				for y in range(3):
-					# Check if this bay is empty
-					if np.isnan(self.itemPositions[shelf, x, y]).any():
-						bay_handle = self.bayHandles[shelf, x, y]
-						
-						if bay_handle is not None:
-							try:
-								position = self.sim.getObjectPosition(bay_handle, self.collectorForceSensorHandle)
-								distance = math.sqrt(sum(pos**2 for pos in position))
-
-								if distance < min_distance:
-									min_distance = distance
-									closest_bay = {
-										'shelf': shelf,
-										'x': x, 
-										'y': y,
-										'distance': distance,
-										'handle': bay_handle
-									}
-							except Exception:
-								continue
-		
-		if closest_bay is None:
-			print(f"No empty shelf bay found within {max_drop_distance}m")
-			return False, None
-			
-		# Drop the item
+		robotCollectionHandle = None
+		closestLabel = None
+		closestHandle = None
+		closestDistance = float('inf')
 		try:
-			print(f"Dropping item at shelf {closest_bay['shelf']}, bay [{closest_bay['x']},{closest_bay['y']}] (distance: {closest_bay['distance']:.2f}m)")
-			self.DropItem()
-			print(f"Successfully dropped item in shelf {closest_bay['shelf']}")
-			return True, closest_bay
-			
+			# Option 1 makes the temporary collection override individual measurable flags.
+			robotCollectionHandle = self.sim.createCollection(1)
+			self.sim.addItemToCollection(
+				robotCollectionHandle, self.sim.handle_tree, self.robotHandle, 0)
+
+			for label, victimHandle in self.victimHandles.items():
+				try:
+					distance = self._get_horizontal_robot_to_victim_distance(
+						victimHandle, robotCollectionHandle)
+				except Exception:
+					continue
+				if distance is not None and distance < closestDistance:
+					closestLabel = label
+					closestHandle = victimHandle
+					closestDistance = distance
 		except Exception as e:
-			print(f"Error dropping item: {e}")
+			print(f"Collection failed while measuring victim distance: {e}")
+			return False, None, None
+		finally:
+			if robotCollectionHandle is not None:
+				try:
+					self.sim.destroyCollection(robotCollectionHandle)
+				except Exception:
+					pass
+
+		maximumDistance = self.robotParameters.victimCollectionDistance
+		if closestHandle is None or closestDistance > maximumDistance:
+			print(f"Collection failed: no victim is within {maximumDistance:.3f} m.")
+			return False, None, None
+
+		if not self._attach_victim_to_carry_point(closestHandle):
+			return False, None, None
+
+		self.carriedVictimHandle = closestHandle
+		self.carriedVictimLabel = closestLabel
+		try:
+			self.victimPositions[closestLabel] = self.sim.getObjectPosition(closestHandle, -1)
+		except Exception:
+			pass
+		print(f"Collected victim {closestLabel} (distance: {closestDistance:.3f} m).")
+		return True, closestLabel, closestDistance
+
+	def ReleaseVictim(self):
+		"""
+		Place the currently carried victim back onto the maze floor.
+
+		The victim is positioned slightly in front of the robot so it is not hidden below
+		the chassis. Its original floor orientation is restored and its lowest transformed
+		bounding-box corner is placed 1 mm above the floor.
+
+		Returns:
+			tuple: (success, victim_label), with victim_label set to None on failure.
+		"""
+		if not self.HasVictim():
+			print("Release failed: the robot is not carrying a victim.")
+			return False, None
+
+		victimHandle = self.carriedVictimHandle
+		victimLabel = self.carriedVictimLabel
+		try:
+			robotPosition = self.sim.getObjectPosition(self.robotHandle, -1)
+			robotOrientation = self.sim.getObjectOrientation(self.robotHandle, -1)
+			robotYaw = robotOrientation[2]
+			dropX = robotPosition[0] + VICTIM_RELEASE_FORWARD_OFFSET * math.cos(robotYaw)
+			dropY = robotPosition[1] + VICTIM_RELEASE_FORWARD_OFFSET * math.sin(robotYaw)
+
+			victimMinimumZ, _ = self._get_oriented_shape_z_extent(
+				victimHandle, self.victimTemplateOrientation)
+			dropZ = self.floorTopZ - victimMinimumZ + VICTIM_SURFACE_CLEARANCE
+
+			parentHandle = self.generatedSceneRootHandle
+			if parentHandle is None:
+				parentHandle = -1
+			self.sim.setObjectParent(victimHandle, parentHandle, True)
+			self.sim.setObjectOrientation(victimHandle, -1, list(self.victimTemplateOrientation))
+			self.sim.setObjectPosition(victimHandle, -1, [dropX, dropY, dropZ])
+
+			self.victimPositions[victimLabel] = [dropX, dropY, dropZ]
+			self.carriedVictimHandle = None
+			self.carriedVictimLabel = None
+			print(f"Released victim {victimLabel} onto the maze floor.")
+			return True, victimLabel
+		except Exception as e:
+			print(f"Error releasing victim {victimLabel}: {e}")
 			return False, None
 
 	def UpdateObjectPositions(self):
@@ -803,9 +730,6 @@ class COPPELIA_WarehouseRobot(object):
 		# Get current object positions from CoppeliaSim
 		self.GetObjectPositions()
 		
-		# Update item collection state
-		self.UpdateItem()
-
 		return self.robotPose, self.itemPositions, self.obstaclePositions
 	########################################
 	##### INTERNAL HELPER FUNCTIONS #######
@@ -886,8 +810,8 @@ class COPPELIA_WarehouseRobot(object):
 
 		Only the robot, drive motors, floor, table boundary walls, and the maze/post/victim
 		templates are required in this phase - startup aborts if any of these are missing.
-		Robot sensors (vision sensor, object detector, proximity/distance sensors, collector force
-		sensor, rear motors) are optional and resolved best-effort using candidate paths that
+		Robot sensors (vision sensor, object detector, proximity/distance sensors and rear
+		motors) are optional and resolved best-effort using candidate paths that
 		cover both the new and legacy scene layouts. Legacy 2025 warehouse objects (picking
 		stations, obstacles, row markers, shelves, item templates) are resolved best-effort
 		only and never abort startup if missing.
@@ -943,8 +867,8 @@ class COPPELIA_WarehouseRobot(object):
 		if any(handle is None for handle in wallTemplateHandles) or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
 			sys.exit(-1)
 
-		# --- Optional: robot sensors (candidate paths cover both the new and legacy scene layouts) ---
-		self.GetCollectorForceSensorHandle()
+		# --- Search-and-rescue collection point and optional robot sensors ---
+		self.GetVictimCarryPointHandle()
 		self.GetCameraHandle()
 		self.GetObjectDetectorHandle()
 		self.getProximityhandle()
@@ -988,11 +912,11 @@ class COPPELIA_WarehouseRobot(object):
 			['/Robot/VisionSensor/ObjectDetector', '/Robot/ObjectDetector'], 'ObjectDetector', required=False)
 		return 0 if self.objectDetectorHandle is not None else -1
 
-	# Get ZMQ CollectorForceSensor Handle
-	def GetCollectorForceSensorHandle(self):
-		self.collectorForceSensorHandle = self._resolve_first_available(
-			['/Robot/CollectorForceSensor'], 'CollectorForceSensor', required=False)
-		return 0 if self.collectorForceSensorHandle is not None else -1
+	def GetVictimCarryPointHandle(self):
+		"""Resolve the scene-authored dummy that defines the carried victim pose."""
+		self.victimCarryPointHandle = self._resolve_first_available(
+			['/Robot/VictimCarryPoint'], 'VictimCarryPoint', required=False)
+		return 0 if self.victimCarryPointHandle is not None else -1
 
 			
 	# Get COPPELIA Motor Handles
@@ -1249,6 +1173,40 @@ class COPPELIA_WarehouseRobot(object):
 			raise ValueError(f"Could not read bounding box for shape handle {handle}: {e}")
 
 		return boundingBox[0], boundingBox[1], boundingBox[2]
+
+	@staticmethod
+	def _transform_point(matrix, point):
+		"""Transform a 3D point with a CoppeliaSim 3x4 transformation matrix."""
+		return [
+			matrix[0] * point[0] + matrix[1] * point[1] + matrix[2] * point[2] + matrix[3],
+			matrix[4] * point[0] + matrix[5] * point[1] + matrix[6] * point[2] + matrix[7],
+			matrix[8] * point[0] + matrix[9] * point[1] + matrix[10] * point[2] + matrix[11],
+		]
+
+	def _get_shape_bbox_points(self, handle):
+		"""Return all eight bounding-box corners in the shape's object reference frame."""
+		size, boundingBoxPose = self.sim.getShapeBB(handle)
+		boundingBoxMatrix = self.sim.poseToMatrix(boundingBoxPose)
+		halfSize = [dimension / 2.0 for dimension in size]
+		return [
+			self._transform_point(boundingBoxMatrix, [sx * halfSize[0], sy * halfSize[1], sz * halfSize[2]])
+			for sx in (-1.0, 1.0)
+			for sy in (-1.0, 1.0)
+			for sz in (-1.0, 1.0)
+		]
+
+	def _get_shape_z_extent_for_matrix(self, handle, shapeMatrix):
+		"""Return the minimum/maximum Z of a shape bounding box after a transform."""
+		zValues = [
+			self._transform_point(shapeMatrix, point)[2]
+			for point in self._get_shape_bbox_points(handle)
+		]
+		return min(zValues), max(zValues)
+
+	def _get_oriented_shape_z_extent(self, handle, orientation):
+		"""Return a shape's Z extent about its origin for a requested Euler orientation."""
+		orientationMatrix = self.sim.buildMatrix([0.0, 0.0, 0.0], list(orientation))
+		return self._get_shape_z_extent_for_matrix(handle, orientationMatrix)
 
 	def _get_floor_info(self):
 		"""
@@ -1754,14 +1712,17 @@ class COPPELIA_WarehouseRobot(object):
 
 	def _generate_victims(self):
 		"""Create one /victim copy at each configured victim cell centre."""
-		victimHeight = self.victimTemplateSize[2]
-		clearance = 0.001  # small gap to avoid initial mesh penetration with the floor
+		victimMinimumZ, _ = self._get_oriented_shape_z_extent(
+			self.victimTemplateHandle, self.victimTemplateOrientation)
+		# Offset the object origin so the lowest transformed bounding-box corner is just
+		# above the floor. This remains correct when the imported victim's local Z axis is
+		# not its world vertical axis or its bounding box is offset from the object frame.
+		zPos = self.floorTopZ - victimMinimumZ + VICTIM_SURFACE_CLEARANCE
 		count = 0
 		for label, cell in self.sceneParameters.victimCells.items():
 			column, row = cell
 			x, y = self._cell_center_to_world(column, row)
 			newHandle = self.sim.copyPasteObjects([self.victimTemplateHandle], 0)[0]
-			zPos = self.floorTopZ + victimHeight / 2.0 + clearance
 			self.sim.setObjectPosition(newHandle, -1, [x, y, zPos])
 			self.sim.setObjectOrientation(newHandle, -1, list(self.victimTemplateOrientation))
 			self.sim.setObjectAlias(newHandle, f"EGB320_GEN_VICTIM_{label}")
@@ -1914,6 +1875,8 @@ class COPPELIA_WarehouseRobot(object):
 		self.victimHandles = {}
 		self.victimPositions = {}
 		self.markerWallPlacements = []
+		self.carriedVictimHandle = None
+		self.carriedVictimLabel = None
 
 		print(f"Cleanup removed {removedCount} previously generated object(s).")
 		return removedCount
@@ -2231,30 +2194,6 @@ class COPPELIA_WarehouseRobot(object):
 		return False
 
 
-	# Update the item
-	def UpdateItem(self):
-		for shelf,x,y in [(s,x,y) for s in range(6) for x in range(4) for y in range(3)]:
-			itemPosition = self.itemPositions[shelf,x,y]
-		
-			if np.all(np.isnan(itemPosition)) == False:
-
-				itemDist = self.CollectorToItemDistance(itemPosition)
-
-
-				if self.itemConnectedToRobot == True:
-					# random chance to disconnect
-					if np.random.rand() > self.robotParameters.collectorQuality:
-						# terminate connection between item and robot to simulate collector
-						try:
-							self.sim.callScriptFunction('RobotReleaseItem', self.scriptHandle, [], [], [], "")
-							self.itemConnectedToRobot = False
-						except Exception as e:
-							print(f"Error calling RobotReleaseItem script function: {e}")
-
-				elif itemDist != None and itemDist > 0.03:
-					self.itemConnectedToRobot = False
-
-	
 	# Legacy 2025 boundary-only wall geometry. Retained internally as a possible reference for
 	# a future maze-aware replacement, but deliberately not called by GetDetectedWallPoints().
 	# Gets the range and bearing to a corner that is within the camera's field of view.
@@ -2557,9 +2496,8 @@ class RobotParameters(object):
 		self.maxShelfDetectionDistance = 2.0     # max distance to detect shelves in m
 		self.minWallDetectionDistance = 0.02      # min distance for a wall point to be considered valid, in m
 		
-		# Collector Parameters
-		self.collectorQuality = 1.0      # collector quality from 0 to 1
-		self.maxCollectDistance = 0.15   # max distance for collection in m
+		# Victim collection parameter from the 2026 assessment rules
+		self.victimCollectionDistance = 0.10  # shortest horizontal clearance in metres
 		
 		# Simulation Parameters
 		self.sync = False  # synchronous mode (deprecated with ZMQ Remote API)

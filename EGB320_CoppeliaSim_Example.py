@@ -21,7 +21,7 @@ STUDENT TASKS:
 =============
 - Modify the robot movement commands in the main loop
 - Implement navigation/mapping using object and wall detection data
-- Victim detection/collection is not implemented in this phase - that's up to you
+- Implement victim detection and call CollectVictim() when your robot finds a victim
 
 For more information, see the documentation in warehousebot_lib.py
 """
@@ -62,9 +62,8 @@ robotParameters.cameraDistanceFromRobotCenter = 0.1  # Distance from robot cente
 robotParameters.cameraHeightFromFloor = 0.15      # Height above floor (m)
 robotParameters.cameraTilt = 0.0                  # Camera tilt angle (radians)
 
-# Item collection settings (legacy 2025 warehouse challenge - unused in this phase)
-robotParameters.collectorQuality = 1              # Collector reliability (0-1)
-robotParameters.maxCollectDistance = 0.15         # Maximum collection distance (m)
+# Victim collection setting from the assessment rules
+robotParameters.victimCollectionDistance = 0.10  # Maximum horizontal clearance (m)
 
 # Simulation settings
 robotParameters.sync = False  # Use asynchronous mode (recommended)

@@ -15,20 +15,20 @@ WHAT THIS EXAMPLE DOES:
 - Connects to CoppeliaSim
 - Generates the Phase 1 example maze (7x7 cells, wall posts and three victims)
 - Places the robot at the base cell
-- Lets you drive the robot around with the keyboard (WASD + space to stop)
+- Lets you drive the robot around with the keyboard and attempt victim collection
 
 KEYBOARD CONTROLS:
 ==================
 W / S - drive forward / backward
 A / D - rotate left / right on the spot
-SPACE - stop
+SPACE - collect a nearby victim, or release the carried victim
 Q     - quit
 Hold a movement key to drive. Releasing the key immediately commands zero velocity.
 
 STUDENT TASKS:
 =============
 - Implement navigation/mapping using object and wall detection data
-- Victim detection/collection is not implemented in this phase - that's up to you
+- Implement victim detection and call CollectVictim() when your robot finds a victim
 
 For more information, see the documentation in warehousebot_lib.py
 """
@@ -74,8 +74,6 @@ def get_keyboard_command():
 	"""Return the velocity command represented by the currently held keys."""
 	if is_key_down('q'):
 		raise KeyboardInterrupt
-	if is_key_down('space'):
-		return 0.0, 0.0
 
 	linearVelocity = keyboardForwardSpeed * (int(is_key_down('w')) - int(is_key_down('s')))
 	angularVelocity = keyboardTurnSpeed * (int(is_key_down('a')) - int(is_key_down('d')))
@@ -104,13 +102,12 @@ robotParameters.driveSystemQuality = 1            # Drive quality (0-1, 1=perfec
 
 # Camera settings
 robotParameters.cameraOrientation = 'landscape'   # Camera orientation
-robotParameters.cameraDistanceFromRobotCenter = 0.1  # Distance from robot center (m)
+robotParameters.cameraDistanceFromRobotCenter = 0.0  # Distance from robot center (m)
 robotParameters.cameraHeightFromFloor = 0.15      # Height above floor (m)
-robotParameters.cameraTilt = 0.0                  # Camera tilt angle (radians)
+robotParameters.cameraTilt = -0.3                  # Camera tilt angle (radians)
 
-# Item collection settings (legacy 2025 warehouse challenge - unused in this phase)
-robotParameters.collectorQuality = 1              # Collector reliability (0-1)
-robotParameters.maxCollectDistance = 0.15         # Maximum collection distance (m)
+# Victim collection setting from the assessment rules
+robotParameters.victimCollectionDistance = 0.10  # Maximum horizontal clearance (m)
 
 # Simulation settings
 robotParameters.sync = False  # Use asynchronous mode (recommended)
@@ -142,9 +139,11 @@ if __name__ == '__main__':
 
 		# Main control loop
 		print("Starting main control loop...")
-		print("Use W/A/S/D to drive, SPACE to stop, Q to quit.")
+		print("Use W/A/S/D to drive, SPACE to collect/release a victim, Q to quit.")
 
 		lastSentCommand = (0.0, 0.0)
+		spaceWasDown = False
+		collectionStatus = "No victim collection attempted."
 
 		while True:
 			# Send only when the held-key command changes. Releasing the movement keys changes
@@ -154,6 +153,26 @@ if __name__ == '__main__':
 				warehouseBotSim.SetTargetVelocities(*keyboardCommand)
 				lastSentCommand = keyboardCommand
 
+			# Trigger one collection/release action on the press edge. Holding Space does not
+			# repeatedly call either API.
+			spaceIsDown = is_key_down('space')
+			if spaceIsDown and not spaceWasDown:
+				if warehouseBotSim.HasVictim():
+					success, victimLabel = warehouseBotSim.ReleaseVictim()
+					if success:
+						collectionStatus = f"Released victim {victimLabel} onto the maze floor."
+					else:
+						collectionStatus = "Victim release failed."
+				else:
+					success, victimLabel, collectionDistance = warehouseBotSim.CollectVictim()
+					if success:
+						collectionStatus = (
+							f"Collected victim {victimLabel} at {collectionDistance:.3f} m clearance.")
+					else:
+						collectionStatus = (
+							f"Collection failed: no victim is within "
+							f"{robotParameters.victimCollectionDistance:.3f} m.")
+			spaceWasDown = spaceIsDown
 
 			# Robot-relative proximity readings. None means no detectable object is in range.
 			wallDistances = warehouseBotSim.GetWallDistances()
@@ -170,7 +189,7 @@ if __name__ == '__main__':
 				clear_screen()
 				print("EGB320 Search and Rescue Robot - Status")
 				print("=" * 50)
-				print("Controls: W/S = forward/back, A/D = rotate, SPACE = stop, Q = quit")
+				print("Controls: W/S = forward/back, A/D = rotate, SPACE = collect/release, Q = quit")
 				print(
 					f"Commanded velocity (x_dot, theta_dot): {lastSentCommand[0]:0.2f} m/s, "
 					f"{lastSentCommand[1]:0.2f} rad/s")
@@ -183,6 +202,10 @@ if __name__ == '__main__':
 					f"left={format_distance(wallDistances['left'])}, "
 					f"front={format_distance(wallDistances['front'])}, "
 					f"right={format_distance(wallDistances['right'])}")
+
+				print(f"Victim collection: {collectionStatus}")
+				if warehouseBotSim.HasVictim():
+					print(f"Carrying victim: {warehouseBotSim.carriedVictimLabel}")
 
 				# Ground-truth victim positions (victim detection is not implemented in this phase)
 				for label, position in warehouseBotSim.victimPositions.items():
