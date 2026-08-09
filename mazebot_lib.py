@@ -8,9 +8,9 @@ from collections import deque
 from enum import IntEnum
 
 """
-EGB320 Search and Rescue Robot Library (2026)
+EGB320 Search and Rescue MazeBot Library (2026)
 
-This library provides a Python interface for controlling the EGB320 robot in CoppeliaSim.
+This library provides a Python interface for controlling the EGB320 maze robot in CoppeliaSim.
 
 As of this phase, the library targets the 2026 search and rescue maze challenge. It uses
 the CoppeliaSim ZeroMQ Python remote API to deterministically generate a 7x7 cell maze
@@ -25,7 +25,7 @@ Robot Control:
 - UpdateObjectPositions()               : Update object positions (call this every loop!)
 
 Object Detection:
-- GetDetectedObjects(objects)           : Get range/bearing to all detected objects (legacy warehouse objects)
+- GetDetectedObjects(objects)           : Get range/bearing to optional obstacle objects
 - GetCameraImage()                      : Get camera image for computer vision
 - GetWallDistances()                    : Get robot-relative left/front/right proximity readings
 
@@ -40,7 +40,7 @@ Configuration:
 EXAMPLE USAGE:
 =============
 # Initialize robot
-robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
+robot = COPPELIA_MazeRobot(robotParameters, sceneParameters)
 robot.StartSimulator()  # generates the maze, then starts the simulation
 
 # Main control loop
@@ -128,33 +128,33 @@ VICTIM_RELEASE_FORWARD_OFFSET = 0.15
 
 
 # Object types retained for the search-and-rescue challenge.
-class warehouseObjects(IntEnum):
+class mazeObjects(IntEnum):
 	# Obstacle objects
-	obstacle0 = 6
-	obstacle1 = 7
-	obstacle2 = 8
+	obstacle0 = 0
+	obstacle1 = 1
+	obstacle2 = 2
 
 	# Obstacle group for detection
-	obstacles = 102
+	obstacles = 100
 
 
 ################################
-##### WAREHOUSE BOT CLASS #####
+##### MAZE BOT CLASS #####
 ################################
 
-class COPPELIA_WarehouseRobot(object):
+class COPPELIA_MazeRobot(object):
 	"""
-	Main class for controlling the warehouse robot in CoppeliaSim.
-	This class provides functions for robot navigation, object detection, and item collection.
+	Main class for controlling the search-and-rescue maze robot in CoppeliaSim.
+	This class provides robot navigation, sensing, maze generation and victim collection.
 	"""
 	
 	####################################
-	#### WAREHOUSE BOT INITIALIZATION ###
+	#### MAZE BOT INITIALIZATION ###
 	####################################
 
 	def __init__(self, robotParameters, sceneParameters, coppelia_server_ip='127.0.0.1', port=23000):
 		"""
-		Initialize the warehouse robot connection to CoppeliaSim.
+		Initialize the maze robot connection to CoppeliaSim.
 		
 		Args:
 			robotParameters: RobotParameters object with robot configuration
@@ -162,7 +162,7 @@ class COPPELIA_WarehouseRobot(object):
 			coppelia_server_ip: IP address of CoppeliaSim server (default: '127.0.0.1')
 			port: Port number for ZMQ Remote API (default: 23000)
 		"""
-		print(f"Initializing warehouse robot connection...")
+		print("Initializing maze robot connection...")
 		
 		# Store parameters
 		self.robotParameters = robotParameters
@@ -191,15 +191,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.v60MotorHandle = None
 		self.v180MotorHandle = None
 		self.v300MotorHandle = None
-		self.itemTemplateHandles = [None] * 6
-		self.itemHandles = np.zeros((6,4,3),dtype=np.int16)
 		self.obstacleHandles = [None, None, None]
-		self.pickingStationHandle = None
-		self.pickingStationMarkerHandles = [None, None, None]
-		self.pickingStationItemHandles = [None, None, None]
-		self.rowMarkerHandles = [None,None,None]
-		self.shelfHandles = [None]*6
-		self.bayHandles = np.full((6,4,3), None, dtype=object)
 		self.proximityHandle = None
 		self.distanceSensorHandles = {
 			'left': None,
@@ -251,15 +243,11 @@ class COPPELIA_WarehouseRobot(object):
 
 		# Physical parameters
 		self.obstacleSize = 0.18  # diameter of obstacle in meters
-		self.itemSize = 0.05      # diameter of item in meters
 
 		# Object position variables
 		self.robotPose = None
 		self.cameraPose = None
-		self.itemPositions = np.full((6,4,3,3),np.nan,dtype=np.float32)
-		self.pickingStationPosition = None
 		self.obstaclePositions = [None, None, None]
-		self.rowMarkerPositions = [None, None, None]
 
 		# Connect to CoppeliaSim
 		print("Connecting to CoppeliaSim...")
@@ -275,7 +263,7 @@ class COPPELIA_WarehouseRobot(object):
 		print("Configuring robot parameters...")
 		self.UpdateCOPPELIARobot()
 		
-		print("Warehouse robot initialization complete!")
+		print("Maze robot initialization complete!")
 	
 	########################################
 	##### MAIN API FUNCTIONS FOR STUDENTS #####
@@ -351,58 +339,35 @@ class COPPELIA_WarehouseRobot(object):
 					return [_range, _bearing]
 		return None
 	
-	def _process_multiple_object_detection(self, positions, start_index, objectsDetected, max_detection_distance):
-		"""Helper function to process detection of multiple objects with sequential indices"""
-		results = []
-		for index, position in enumerate(positions):
-			result = self._process_single_object_detection(position, start_index + index, objectsDetected, max_detection_distance)
-			results.append(result)
-		return results
-	
-	def _add_item_to_range_bearing(self, itemRangeBearing, item_type, range_bearing):
-		"""Helper function to add item detection to range bearing list"""
-		if itemRangeBearing[item_type] is None:
-			itemRangeBearing[item_type] = []
-		itemRangeBearing[item_type].append(range_bearing)
-
 	def GetDetectedObjects(self, objects=None):
 		"""
 		Gets the range and bearing to requested obstacles in the camera's field of view.
 		
 		Args:
-			objects: List containing warehouseObjects.obstacles and/or individual obstacle
+			objects: List containing mazeObjects.obstacles and/or individual obstacle
 				types. Defaults to all obstacles.
 			
 		Returns:
-			tuple: Legacy six-value result with obstaclesRB in the third position. Retired
-				pick-and-place result fields remain empty for compatibility.
+			list: Detected obstacles as [range, bearing] pairs. Returns an empty list when
+				no requested obstacle is detected.
 		"""
-		# Retain the historical return shape while the student API transitions away from
-		# the pick-and-place challenge.
-		itemRangeBearing = [None]*6
-		pickingStationRangeBearing = None
-		obstaclesRangeBearing = None
-		rowMarkerRangeBearing = [None,None,None]
-		shelfRangeBearing = [None]*6
-		pickingStationMarkersRangeBearing = [None, None, None]
-
 		# Default to detecting all obstacles if none are specified.
 		if objects is None:
-			objects = [warehouseObjects.obstacles]
+			objects = [mazeObjects.obstacles]
 
 		requestedObjects = set(objects)
 		obstacleTypes = (
-			warehouseObjects.obstacle0,
-			warehouseObjects.obstacle1,
-			warehouseObjects.obstacle2,
+			mazeObjects.obstacle0,
+			mazeObjects.obstacle1,
+			mazeObjects.obstacle2,
 		)
-		detectAllObstacles = warehouseObjects.obstacles in requestedObjects
+		detectAllObstacles = mazeObjects.obstacles in requestedObjects
 		if not detectAllObstacles and not any(obstacle in requestedObjects for obstacle in obstacleTypes):
-			return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
+			return []
 
 		# Check if camera and detector data are available.
 		if self.cameraPose is None or self.objectDetectorHandle is None:
-			return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
+			return []
 
 		# Get object detection data from CoppeliaSim vision sensor
 		try:
@@ -416,23 +381,24 @@ class COPPELIA_WarehouseRobot(object):
 		except Exception:
 			objectsDetected = []
 
-		if objectsDetected and len(objectsDetected) > 0:
-			# Obstacles retain their historical detector packet indices 6-8.
+		obstaclesRangeBearing = []
+		if objectsDetected:
+			# New maze-only detector scripts use indices 0-2. Accept the previous 6-8
+			# layout as well so existing scene sensor scripts continue to work.
+			detectorIndexOffset = 6 if len(objectsDetected) >= 9 else 0
 			for index, obstaclePosition in enumerate(self.obstaclePositions):
 				if not detectAllObstacles and obstacleTypes[index] not in requestedObjects:
 					continue
 				if obstaclePosition is not None:
 					result = self._process_single_object_detection(
 						obstaclePosition,
-						int(obstacleTypes[index]),
+						detectorIndexOffset + index,
 						objectsDetected,
 						self.robotParameters.maxObstacleDetectionDistance)
 					if result is not None:
-						if obstaclesRangeBearing is None:
-							obstaclesRangeBearing = []
 						obstaclesRangeBearing.append(result)
 
-		return itemRangeBearing, pickingStationRangeBearing, obstaclesRangeBearing, rowMarkerRangeBearing, shelfRangeBearing, pickingStationMarkersRangeBearing
+		return obstaclesRangeBearing
 
 
 	def GetCameraImage(self):
@@ -463,7 +429,7 @@ class COPPELIA_WarehouseRobot(object):
 		"""
 		Legacy compatibility stub; wall-point estimation is not supported for the 2026 maze.
 
-		The previous warehouse implementation only intersected the camera field-of-view with
+		The previous boundary-only implementation intersected the camera field-of-view with
 		four fixed, axis-aligned arena boundaries. It does not account for generated internal
 		maze walls or diagonal wall segments and therefore produced misleading readings.
 		Use GetWallDistances() for the robot-relative proximity sensors instead. A future
@@ -725,12 +691,12 @@ class COPPELIA_WarehouseRobot(object):
 		This should be called in every loop to get accurate object detection.
 		
 		Returns:
-			tuple: (robotPose, itemPositions, obstaclePositions) for debugging purposes
+			tuple: (robotPose, obstaclePositions) for debugging purposes
 		"""
 		# Get current object positions from CoppeliaSim
 		self.GetObjectPositions()
 		
-		return self.robotPose, self.itemPositions, self.obstaclePositions
+		return self.robotPose, self.obstaclePositions
 	########################################
 	##### INTERNAL HELPER FUNCTIONS #######
 	########################################
@@ -811,10 +777,7 @@ class COPPELIA_WarehouseRobot(object):
 		Only the robot, drive motors, floor, table boundary walls, and the maze/post/victim
 		templates are required in this phase - startup aborts if any of these are missing.
 		Robot sensors (vision sensor, object detector, proximity/distance sensors and rear
-		motors) are optional and resolved best-effort using candidate paths that
-		cover both the new and legacy scene layouts. Legacy 2025 warehouse objects (picking
-		stations, obstacles, row markers, shelves, item templates) are resolved best-effort
-		only and never abort startup if missing.
+		motors) are optional and resolved best-effort. Optional obstacles never abort startup.
 		"""
 		# --- Essential: robot + drive motors ---
 		errorCode = self.GetRobotHandle()
@@ -874,10 +837,7 @@ class COPPELIA_WarehouseRobot(object):
 		self.getProximityhandle()
 		self.GetDistanceSensorHandles()
 
-		# --- Legacy (2025 warehouse challenge) objects: best-effort only, never abort startup ---
-		# Picking stations, item templates, row markers and shelves/bays no longer exist in the
-		# search and rescue maze scene, so they are not resolved here. Obstacles are kept since
-		# they may still be used (e.g. for future rubble/hazard objects).
+		# Optional maze obstacles are best-effort and never abort startup.
 		self.GetObstacleHandles()
 
 	############################################
@@ -949,46 +909,9 @@ class COPPELIA_WarehouseRobot(object):
 
 		return errorCode1, errorCode2, errorCode3, errorCode4
 
-	# Get ZMQ Picking Station Handles (legacy 2025 warehouse challenge; not used in this phase)
-	def GetPickingStationHandle(self):
-		"""Best-effort resolution of legacy picking station handles. Missing objects are expected in this phase."""
-		missing = []
-
-		self.pickingStationHandle = self._try_get_object('/Picking_station')
-		if self.pickingStationHandle is None:
-			missing.append('/Picking_station')
-
-		for i in range(3):
-			path = f'/Picking_station_{i+1}'
-			handle = self._try_get_object(path)
-			self.pickingStationMarkerHandles[i] = handle
-			if handle is None:
-				missing.append(path)
-
-		if missing:
-			print(f"Legacy picking station objects not found (expected in this phase): {', '.join(missing)}")
-		return 0
-
-	# Get ZMQ item Template Handles (legacy 2025 warehouse challenge; not used in this phase)
-	def GetItemTemplateHandles(self):
-		"""Best-effort resolution of legacy warehouse item templates. Missing objects are expected in this phase."""
-		error_codes = []
-		missing = []
-		for index, name in enumerate(["BOWL","MUG","BOTTLE","SOCCER_BALL","RUBIKS_CUBE","CEREAL_BOX"]):
-			handle = self._try_get_object(f'/{name}')
-			self.itemTemplateHandles[index] = handle
-			if handle is not None:
-				error_codes.append(0)
-			else:
-				error_codes.append(-1)
-				missing.append(name)
-		if missing:
-			print(f"Legacy item templates not found (expected in this phase): {', '.join(missing)}")
-		return error_codes
-
-	# Get ZMQ Obstacle Handles (legacy 2025 warehouse challenge; not used in this phase)
+	# Get optional maze obstacle handles.
 	def GetObstacleHandles(self):
-		"""Best-effort resolution of legacy obstacle handles. Missing objects are expected in this phase."""
+		"""Best-effort resolution of optional obstacle handles."""
 		error_codes = [0, 0, 0]
 		missing = []
 		for index in range(3):
@@ -999,41 +922,8 @@ class COPPELIA_WarehouseRobot(object):
 				error_codes[index] = -1
 				missing.append(path)
 		if missing:
-			print(f"Legacy obstacles not found (expected in this phase): {', '.join(missing)}")
+			print(f"Optional obstacles not found: {', '.join(missing)}")
 		return tuple(error_codes)
-	
-	# Get ZMQ Row marker handles (legacy 2025 warehouse challenge; not used in this phase)
-	def GetRowMarkerHandles(self):
-		"""Best-effort resolution of legacy row marker handles. Missing objects are expected in this phase."""
-		error_codes = [0, 0, 0]
-		missing = []
-		for i in range(3):
-			path = f'/row_marker{i+1}'
-			handle = self._try_get_object(path)
-			self.rowMarkerHandles[i] = handle
-			if handle is None:
-				error_codes[i] = -1
-				missing.append(path)
-		if missing:
-			print(f"Legacy row markers not found (expected in this phase): {', '.join(missing)}")
-		return tuple(error_codes)
-
-
-	# Get ZMQ shelf handles (legacy 2025 warehouse challenge; not used in this phase)
-	def getShelfHandles(self):
-		"""Best-effort resolution of legacy shelf handles. Missing objects are expected in this phase."""
-		errorCodes = [0]*6
-		missing = []
-		for i in range(6):
-			path = f'/Shelf{i}'
-			handle = self._try_get_object(path)
-			self.shelfHandles[i] = handle
-			if handle is None:
-				errorCodes[i] = -1
-				missing.append(path)
-		if missing:
-			print(f"Legacy shelves not found (expected in this phase): {', '.join(missing)}")
-		return tuple(errorCodes)
 
 	# Get ZMQ proximity sensor handle.
 	def getProximityhandle(self):
@@ -1057,27 +947,6 @@ class COPPELIA_WarehouseRobot(object):
 
 		return 0 if all(handle is not None for handle in self.distanceSensorHandles.values()) else -1
 
-	# Get ZMQ bay handles for each shelf (legacy 2025 warehouse challenge; not used in this phase)
-	def getBayHandles(self):
-		"""Best-effort resolution of legacy shelf bay handles. Missing objects are expected in this phase."""
-		error_codes = []
-		foundCount = 0
-		totalCount = 0
-		for shelf in range(6):  # 6 shelves (0-5)
-			for x in range(4):  # 4 x positions (0-3)
-				for y in range(3):  # 3 y positions/heights (0-2)
-					totalCount += 1
-					bay_name = '/Shelf%d/Bay%d%d' % (shelf, x, y)
-					handle = self._try_get_object(bay_name)
-					self.bayHandles[shelf, x, y] = handle
-					if handle is not None:
-						foundCount += 1
-						error_codes.append(0)
-					else:
-						error_codes.append(-1)
-		print(f"Legacy shelf bays found: {foundCount}/{totalCount} (expected 0 in this phase)")
-		return error_codes
-	
 	###############################################
 	####### ROBOT AND SCENE SETUP FUNCTIONS #######
 	###############################################
@@ -1143,8 +1012,7 @@ class COPPELIA_WarehouseRobot(object):
 		self._log_table_wall_positions()
 		self._print_scene_summary(postCount, wallCount, victimCount, removedCount)
 
-		# Legacy 2025 warehouse extra - safe no-op when no legacy obstacles exist in the scene
-		self._legacy_set_obstacle_positions()
+		self._set_obstacle_positions()
 
 	########################################
 	##### SEARCH AND RESCUE MAZE GENERATION #####
@@ -1906,8 +1774,8 @@ class COPPELIA_WarehouseRobot(object):
 		print(f"Victim cells: {victimCellsText}")
 		print(f"Objects removed during cleanup: {removedCount}")
 
-	def _legacy_set_obstacle_positions(self):
-		"""Legacy 2025 warehouse-challenge obstacle placement. No-op when no legacy obstacles exist in the scene."""
+	def _set_obstacle_positions(self):
+		"""Place optional obstacles at configured positions, when present."""
 		if not any(h is not None for h in self.obstacleHandles):
 			return
 		obstacleHeight = 0.15
@@ -1923,54 +1791,7 @@ class COPPELIA_WarehouseRobot(object):
 			try:
 				self.sim.setObjectPosition(self.obstacleHandles[index], -1, coppeliaStartingPosition)
 			except Exception as e:
-				print(f"Warning: error setting legacy obstacle {index} position: {e}")
-
-	def _legacy_set_picking_station_contents(self):
-		"""Legacy 2025 warehouse-challenge picking station item placement. No-op when no legacy picking stations exist."""
-		if not any(h is not None for h in self.pickingStationMarkerHandles):
-			return
-		self.SetPickingStationContents()
-
-	def SetPickingStationContents(self):
-		"""Place items at picking stations based on sceneParameters.pickingStationContents"""
-		print('Placing items at picking stations...')
-		
-		for station_index in range(3):
-			item_type = self.sceneParameters.pickingStationContents[station_index]
-			
-			if item_type != -1 and 0 <= item_type <= 5:  # Valid item type
-				station_handle = self.pickingStationMarkerHandles[station_index]
-				
-				if station_handle is not None:
-					try:
-						# Get the position of the picking station
-						station_position = self.sim.getObjectPosition(station_handle, -1)
-						
-						# Place item slightly above the picking station surface
-						item_position = [station_position[0], station_position[1], station_position[2]+0.01]
-						
-						# Copy the item template to this position
-						item_names = ["BOWL", "MUG", "BOTTLE", "SOCCER_BALL", "RUBIKS_CUBE", "CEREAL_BOX"]
-						template_handle = self.itemTemplateHandles[item_type]
-						
-						if template_handle is not None:
-							# Copy the item from template
-							new_item_handle = self.sim.copyPasteObjects([template_handle], 0)[0]
-							
-							# Store the item handle for collection purposes
-							self.pickingStationItemHandles[station_index] = new_item_handle
-							
-							# Position the item at the picking station
-							self.sim.setObjectPosition(new_item_handle, -1, item_position)
-							
-							print(f'Placed {item_names[item_type]} at picking station {station_index + 1}')
-						else:
-							print(f'Warning: Template for {item_names[item_type]} not found')
-							
-					except Exception as e:
-						print(f'Error placing item at picking station {station_index + 1}: {e}')
-				else:
-					print(f'Warning: Picking station {station_index + 1} handle not found')
+				print(f"Warning: error setting obstacle {index} position: {e}")
 
 	### CAMERA FUNCTIONS ###
 
@@ -2070,87 +1891,52 @@ class COPPELIA_WarehouseRobot(object):
 	# Prints the pose/position of the objects in the scene
 	def PrintObjectPositions(self):
 		print("\n\n***** OBJECT POSITIONS *****")
-		if self.robotPose != None:
+		if self.robotPose is not None:
 			print("Robot 2D Pose (x,y,theta): %0.4f, %0.4f, %0.4f"%(self.robotPose[0], self.robotPose[1], self.robotPose[2]))
 
-		if self.cameraPose != None:
+		if self.cameraPose is not None:
 			print("Camera 3D Pose (x,y,z,roll,pitch,yaw): %0.4f, %0.4f, %0.4f, %0.4f, %0.4f, %0.4f"%(self.cameraPose[0], self.cameraPose[1], self.cameraPose[2], self.cameraPose[3], self.cameraPose[4], self.cameraPose[5]))
-		
-		for shelf,x,y in [(s,x,y) for s in range(6) for x in range(4) for y in range(3)]:
-			itemPosition = self.itemPositions[shelf,x,y]
-			if np.all(np.isnan(itemPosition)) == False:
-				print("item from bay [%d,%d,%d] Position (x,y,z): %0.4f, %0.4f, %0.4f"%(shelf,x,y, itemPosition[0], itemPosition[1], itemPosition[2]))
-			
-		if self.packingBayPosition != None:
-			print("PackingBay Position (x,y,z): %0.4f, %0.4f, %0.4f"%(self.packingBayPosition[0], self.packingBayPosition[1], self.packingBayPosition[2]))
-			
+
 		for index, obstacle in enumerate(self.obstaclePositions):
-			if obstacle != None:
+			if obstacle is not None:
 				print("Obstacle %d Position (x,y,z): %0.4f, %0.4f, %0.4f"%(index, obstacle[0], obstacle[1], obstacle[2]))
 
 	# Gets the pose/position in the global coordinate frame of all the objects in the scene.
 	# Stores them in class variables. Variables will be set to none if could not be updated
 	def GetObjectPositions(self):
-		# Set camera pose and object position to None so can check in an error occurred
+		# Clear cached values so callers can distinguish an update failure.
 		self.robotPose = None
 		self.cameraPose = None
-		# self.itemPositions = [None]*len(self.itemHandles)
-		self.pickingStationPosition = None
 		self.obstaclePositions = [None, None, None]
 
 		# GET 2D ROBOT POSE
 		try:
 			robotPosition = self.sim.getObjectPosition(self.robotHandle, -1)
 			robotOrientation = self.sim.getObjectOrientation(self.robotHandle, -1)
-			self.robotPose = [robotPosition[0], robotPosition[1], robotPosition[1], robotOrientation[0], robotOrientation[1], robotOrientation[2]]
+			self.robotPose = [robotPosition[0], robotPosition[1], robotOrientation[2]]
 		except Exception as e:
 			print(f"Error getting robot pose: {e}")
+			robotOrientation = [0.0, 0.0, 0.0]
 
 		# GET 3D CAMERA POSE
-		try:
-			cameraPosition = self.sim.getObjectPosition(self.cameraHandle, -1)
-			self.cameraPose = [cameraPosition[0], cameraPosition[1], cameraPosition[2], robotOrientation[0], robotOrientation[1], robotOrientation[2]]
-		except Exception as e:
-			print(f"Error getting camera pose: {e}")
-		
-
-		# GET POSITION OF EACH OBJECT
-		# for shelf,x,y in [(s,x,y) for s in range(6) for x in range(4) for y in range(3)]:
-		# 	handle = self.itemHandles[shelf,x,y]
-		# 	try:
-		# 		itemPosition = self.sim.getObjectPosition(handle, -1)
-		# 		self.itemPositions[shelf,x,y] = itemPosition
-		# 	except Exception as e:
-		# 		print(f"Error getting item position for shelf {shelf}, position ({x},{y}): {e}")
-
-		# packingBay position (legacy; no-op when no legacy picking station exists in the scene)
-		if self.pickingStationHandle is not None:
+		if self.cameraHandle is not None:
 			try:
-				self.pickingStationPosition = self.sim.getObjectPosition(self.pickingStationHandle, -1)
+				cameraPosition = self.sim.getObjectPosition(self.cameraHandle, -1)
+				cameraOrientation = self.sim.getObjectOrientation(self.cameraHandle, -1)
+				self.cameraPose = [
+					cameraPosition[0], cameraPosition[1], cameraPosition[2],
+					cameraOrientation[0], cameraOrientation[1], cameraOrientation[2]]
 			except Exception as e:
-				print(f"Error getting picking station position: {e}")
+				print(f"Error getting camera pose: {e}")
 
-		# obstacle positions (legacy; no-op for obstacles that don't exist in the scene)
-		obstaclePositions = [None, None, None]
-		for index, obs in enumerate(self.obstaclePositions):
-			if self.obstacleHandles[index] is None:
+		# Optional obstacle positions.
+		for index, obstacleHandle in enumerate(self.obstacleHandles):
+			if obstacleHandle is None:
 				continue
 			try:
-				obstaclePositions[index] = self.sim.getObjectPosition(self.obstacleHandles[index], -1)
-				self.obstaclePositions[index] = obstaclePositions[index]
+				self.obstaclePositions[index] = self.sim.getObjectPosition(obstacleHandle, -1)
 			except Exception as e:
 				print(f"Error getting obstacle position {index}: {e}")
-
-		# row marker positions (legacy; row markers no longer exist in the search and rescue scene)
-		rowMarkerPositions = [None,None,None]
-		for index, rowMarker in enumerate(self.rowMarkerPositions):
-			if self.rowMarkerHandles[index] is None:
-				continue
-			try:
-				rowMarkerPositions[index] = self.sim.getObjectPosition(self.rowMarkerHandles[index], -1)
-				self.rowMarkerPositions[index] = rowMarkerPositions[index]
-			except Exception as e:
-				print(f"Error getting row marker position {index}: {e}")
 
 	# Checks to see if an Object is within the field of view of the camera
 	def GetRBInCameraFOV(self, objectPosition):
@@ -2368,45 +2154,6 @@ class COPPELIA_WarehouseRobot(object):
 
 		return _range, _bearing
 
-	# Gets the range and bearing to all shelves from the camera position
-	def GetShelfRangeBearing(self):
-		"""
-		Calculate range and bearing to all shelves from the camera position.
-		
-		Returns:
-			list: A list of [range, bearing] pairs for each shelf (6 shelves total).
-				  Returns None for shelves that cannot be detected or don't exist.
-		"""
-		shelfRB = [None] * 6  # Initialize list for 6 shelves
-		
-		if self.cameraPose is None:
-			return shelfRB
-			
-		cameraPose2D = [self.cameraPose[0], self.cameraPose[1], self.cameraPose[5]]
-		
-		for shelf_index in range(6):
-			shelf_handle = self.shelfHandles[shelf_index]
-			
-			if shelf_handle is not None:
-				try:
-					# Get the shelf position
-					shelf_position = self.sim.getObjectPosition(shelf_handle, -1)
-					
-					# Calculate range and bearing from camera to shelf
-					_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose2D, shelf_position)
-					
-					# Check if shelf is within detection range and field of view
-					if _range < self.robotParameters.maxShelfDetectionDistance:
-						# Check if the shelf is within the camera's field of view
-						if abs(_bearing) < self.robotParameters.cameraPerspectiveAngle / 2:
-							shelfRB[shelf_index] = [_range, _bearing]
-				except Exception as e:
-					# If we can't get the shelf position, leave it as None
-					continue
-		
-		return shelfRB
-
-
 def print_debug_range_bearing(object_type, range_bearing_data):
 	"""
 	Helper function to print range and bearing information for detected objects.
@@ -2466,7 +2213,7 @@ def print_debug_range_bearing(object_type, range_bearing_data):
 
 # Parameter classes for robot and scene configuration
 class RobotParameters(object):
-	"""Parameters for configuring the warehouse robot"""
+	"""Parameters for configuring the maze robot."""
 	def __init__(self):
 		# Drive Parameters
 		self.driveType = 'differential'  # currently only 'differential' implemented
@@ -2488,12 +2235,7 @@ class RobotParameters(object):
 		self.cameraPerspectiveAngle = math.pi/3  # field of view angle in radians
 		
 		# Detection Parameters
-		self.maxItemDetectionDistance = 1.0      # max distance to detect items in m
-		self.maxPickingStationDetectionDistance = 2.5  # max distance to detect picking station in m
-		self.maxPickingStationMarkersDetectionDistance = 2.5  # max distance to detect picking station markers in m
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m
-		self.maxRowMarkerDetectionDistance = 2.5  # max distance to detect row markers in m
-		self.maxShelfDetectionDistance = 2.0     # max distance to detect shelves in m
 		self.minWallDetectionDistance = 0.02      # min distance for a wall point to be considered valid, in m
 		
 		# Victim collection parameter from the 2026 assessment rules
@@ -2504,12 +2246,7 @@ class RobotParameters(object):
 
 
 class SceneParameters(object):
-	"""
-	Parameters for configuring the EGB320 search and rescue maze scene (2026).
-
-	Legacy 2025 warehouse-challenge fields are retained for backward compatibility but are
-	not used by the maze generation introduced in this phase.
-	"""
+	"""Parameters for configuring the EGB320 search-and-rescue maze scene (2026)."""
 	def __init__(self):
 		# --- Search and rescue maze parameters (2026) ---
 		self.mazeRows = 7
@@ -2534,16 +2271,7 @@ class SceneParameters(object):
 		# If set, this overrides placeRobotAtBase/baseCell.
 		self.robotStartingPosition = None
 
-		# --- Legacy warehouse-challenge settings (2025 and earlier; unused in this phase) ---
-		# Picking station contents [station]. Set to -1 to leave empty.
-		# Index 0 = picking station 1, Index 1 = picking station 2, Index 2 = picking station 3
-		self.pickingStationContents = [-1, -1, -1]
-
-		# Bay contents [shelf][x][y]. Set to -1 for empty bays.
-		# shelf: 0-5, x: 0-3, y: 0-2 (height levels)
-		self.bayContents = np.full((6, 4, 3), -1, dtype=int)
-
-		# Obstacle starting positions [x, y] in metres.
+		# Optional obstacle starting positions [x, y] in metres.
 		# Set to -1 to use current CoppeliaSim position, None if not wanted in scene
 		self.obstacle0_StartingPosition = None
 		self.obstacle1_StartingPosition = None

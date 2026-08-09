@@ -30,11 +30,11 @@ STUDENT TASKS:
 - Implement navigation/mapping using object and wall detection data
 - Implement victim detection and call CollectVictim() when your robot finds a victim
 
-For more information, see the documentation in warehousebot_lib.py
+For more information, see the documentation in mazebot_lib.py
 """
 
-# Import the warehouse bot library
-from warehousebot_lib import *
+# Import the maze bot library
+from mazebot_lib import *
 
 # Import additional modules
 import os
@@ -126,13 +126,13 @@ if __name__ == '__main__':
 		# Enable/disable debug output
 		show_debug_info = True
 
-		# Create and initialize the warehouse robot
+		# Create and initialize the maze robot
 		print("Connecting to CoppeliaSim...")
-		warehouseBotSim = COPPELIA_WarehouseRobot(robotParameters, sceneParameters, 
-													coppelia_server_ip='127.0.0.1', port=23000)
+		mazeBotSim = COPPELIA_MazeRobot(robotParameters, sceneParameters,
+											coppelia_server_ip='127.0.0.1', port=23000)
 		
 		# Start the simulation (generates the maze, then starts the simulation)
-		warehouseBotSim.StartSimulator()
+		mazeBotSim.StartSimulator()
 
 		if not _HAS_HELD_KEY_INPUT:
 			print("Warning: held-key input is unavailable - keyboard control is disabled on this platform.")
@@ -150,21 +150,21 @@ if __name__ == '__main__':
 			# the command to (0, 0), so exactly one stop command is sent on release.
 			keyboardCommand = get_keyboard_command()
 			if keyboardCommand != lastSentCommand:
-				warehouseBotSim.SetTargetVelocities(*keyboardCommand)
+				mazeBotSim.SetTargetVelocities(*keyboardCommand)
 				lastSentCommand = keyboardCommand
 
 			# Trigger one collection/release action on the press edge. Holding Space does not
 			# repeatedly call either API.
 			spaceIsDown = is_key_down('space')
 			if spaceIsDown and not spaceWasDown:
-				if warehouseBotSim.HasVictim():
-					success, victimLabel = warehouseBotSim.ReleaseVictim()
+				if mazeBotSim.HasVictim():
+					success, victimLabel = mazeBotSim.ReleaseVictim()
 					if success:
 						collectionStatus = f"Released victim {victimLabel} onto the maze floor."
 					else:
 						collectionStatus = "Victim release failed."
 				else:
-					success, victimLabel, collectionDistance = warehouseBotSim.CollectVictim()
+					success, victimLabel, collectionDistance = mazeBotSim.CollectVictim()
 					if success:
 						collectionStatus = (
 							f"Collected victim {victimLabel} at {collectionDistance:.3f} m clearance.")
@@ -175,14 +175,14 @@ if __name__ == '__main__':
 			spaceWasDown = spaceIsDown
 
 			# Robot-relative proximity readings. None means no detectable object is in range.
-			wallDistances = warehouseBotSim.GetWallDistances()
+			wallDistances = mazeBotSim.GetWallDistances()
 
 			# Optional: Get camera image for computer vision processing
 			# This will slow down the sim
-			resolution, image_data = warehouseBotSim.GetCameraImage()
+			# resolution, image_data = mazeBotSim.GetCameraImage()
 
 			# Update object positions (required for accurate detection)
-			warehouseBotSim.UpdateObjectPositions()
+			mazeBotSim.UpdateObjectPositions()
 
 			# Clear screen and show current status
 			if show_debug_info:
@@ -194,8 +194,8 @@ if __name__ == '__main__':
 					f"Commanded velocity (x_dot, theta_dot): {lastSentCommand[0]:0.2f} m/s, "
 					f"{lastSentCommand[1]:0.2f} rad/s")
 
-				if warehouseBotSim.robotPose is not None:
-					print("Robot pose (x, y, theta): %0.3f, %0.3f, %0.3f" % tuple(warehouseBotSim.robotPose[:3]))
+				if mazeBotSim.robotPose is not None:
+					print("Robot pose (x, y, theta): %0.3f, %0.3f, %0.3f" % tuple(mazeBotSim.robotPose[:3]))
 
 				print(
 					"Wall Distance sensors: "
@@ -204,11 +204,11 @@ if __name__ == '__main__':
 					f"right={format_distance(wallDistances['right'])}")
 
 				print(f"Victim collection: {collectionStatus}")
-				if warehouseBotSim.HasVictim():
-					print(f"Carrying victim: {warehouseBotSim.carriedVictimLabel}")
+				if mazeBotSim.HasVictim():
+					print(f"Carrying victim: {mazeBotSim.carriedVictimLabel}")
 
 				# Ground-truth victim positions (victim detection is not implemented in this phase)
-				for label, position in warehouseBotSim.victimPositions.items():
+				for label, position in mazeBotSim.victimPositions.items():
 					print(f"Victim {label} position (x,y,z): {position[0]:0.3f}, {position[1]:0.3f}, {position[2]:0.3f}")
 
 				print("=" * 50)
@@ -217,14 +217,14 @@ if __name__ == '__main__':
 
 	except KeyboardInterrupt:
 		print("\nStopping simulation...")
-		warehouseBotSim.StopSimulator()
+		mazeBotSim.StopSimulator()
 		print("Simulation stopped successfully. Goodbye!")
 
 	except Exception as e:
 		print(f"\nAn error occurred: {e}")
 		print("Stopping simulation...")
 		try:
-			warehouseBotSim.StopSimulator()
+			mazeBotSim.StopSimulator()
 		except:
 			pass
 		print("Please check your CoppeliaSim setup and try again.")

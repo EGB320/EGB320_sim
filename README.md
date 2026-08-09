@@ -1,498 +1,221 @@
-# EGB320 Warehouse Robot Library
+# EGB320 MazeBot Library
 
-A Python library for controlling autonomous warehouse robots in CoppeliaSim simulation environment. This library provides a comprehensive interface for robot navigation, object detection, item collection, and delivery operations.
-
-## Table of Contents
-
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [API Documentation](#api-documentation)
-- [Examples](#examples)
-- [Troubleshooting](#troubleshooting)
-
-## Prerequisites
-
-- **CoppeliaSim** (Version 4.3.0 or later)
-- **Python** 3.7 or later
-- **Git** (for cloning the repository)
+Python support for the 2026 EGB320 search-and-rescue maze simulation in CoppeliaSim. The
+library generates the maze, controls the robot, reads its camera and distance sensors, and
+provides software-triggered victim collection and release.
 
 ## Installation
 
-### 1. Install CoppeliaSim
-
-Download and install CoppeliaSim from the [official website](https://www.coppeliarobotics.com/downloads).
-
-### 2. Clone the Repository
+Install CoppeliaSim and the required Python packages:
 
 ```bash
-git clone https://github.com/EGB320/EGB320_sim.git
+pip install coppeliasim-zmqremoteapi-client opencv-python numpy
 ```
 
-### 3. Install Python Dependencies
-
-Install the required Python packages:
-
-```bash
-# Core dependency for CoppeliaSim communication
-pip install coppeliasim-zmqremoteapi-client
-
-# Additional dependencies for computer vision and GUI
-pip install opencv-python pygame numpy
-```
-
-### 4. Verify Installation
-
-Test your installation by running the example script:
+Load `EGB320_search_and_rescue_2026.ttt` in CoppeliaSim, then run either example:
 
 ```bash
 python EGB320_CoppeliaSim_Example.py
+python EGB320_CoppeliaSim_Example_keyboard.py
 ```
 
-## Quick Start
-
-### Basic Setup
+## Quick start
 
 ```python
-from warehousebot_lib import *
+from mazebot_lib import COPPELIA_MazeRobot, RobotParameters, SceneParameters
 
-# Configure robot parameters
-robotParameters = RobotParameters()
-robotParameters.maximumLinearSpeed = 0.25
-robotParameters.driveSystemQuality = 1
+robot_parameters = RobotParameters()
+scene_parameters = SceneParameters()
 
-# Configure scene parameters
-sceneParameters = SceneParameters()
-
-# Initialize robot
-robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
+robot = COPPELIA_MazeRobot(robot_parameters, scene_parameters)
 robot.StartSimulator()
 
-# Main control loop
 try:
     while True:
-        # Update object positions (CRITICAL!)
         robot.UpdateObjectPositions()
-        
-        # Get object detections
-        objects = robot.GetDetectedObjects([warehouseObjects.obstacles])
-        _, _, obstacles, _, _, _ = objects
-        
-        # Simple navigation
-        if obstacles:
-            robot.SetTargetVelocities(0.0, 0.3)  # Turn away from obstacles
+        distances = robot.GetWallDistances()
+
+        if distances['front'] is not None and distances['front'] < 0.10:
+            robot.SetTargetVelocities(0.0, 0.3)
         else:
-            robot.SetTargetVelocities(0.1, 0.0)
-        
-        time.sleep(0.1)
-        
+            robot.SetTargetVelocities(0.08, 0.0)
 except KeyboardInterrupt:
     robot.StopSimulator()
 ```
 
-## API Documentation
+## Main classes
 
-### Core Classes
+### `COPPELIA_MazeRobot`
 
-#### `COPPELIA_WarehouseRobot`
-
-Main class for controlling the warehouse robot in CoppeliaSim.
-
-**Constructor**
 ```python
-COPPELIA_WarehouseRobot(robotParameters, sceneParameters, coppelia_server_ip='127.0.0.1', port=23000)
+COPPELIA_MazeRobot(
+    robotParameters,
+    sceneParameters,
+    coppelia_server_ip='127.0.0.1',
+    port=23000,
+)
 ```
 
-**Parameters:**
-- `robotParameters` (RobotParameters): Robot configuration object
-- `sceneParameters` (SceneParameters): Scene configuration object  
-- `coppelia_server_ip` (str, optional): CoppeliaSim server IP address. Default: '127.0.0.1'
-- `port` (int, optional): ZMQ Remote API port number. Default: 23000
+The main CoppeliaSim interface.
 
----
+### `RobotParameters`
 
-### Simulation Control
+Configures drive, camera, obstacle-detection and victim-collection behaviour. Important
+settings include:
 
-#### `StartSimulator()`
-
-Starts the CoppeliaSim simulation and initializes the scene.
-
-**Returns:** None
-
-**Raises:** SystemExit if simulation fails to start
-
-**Example:**
 ```python
-robot.StartSimulator()
+parameters.maximumLinearSpeed = 0.25
+parameters.driveSystemQuality = 1.0
+parameters.cameraResolutionX = 640
+parameters.cameraResolutionY = 480
+parameters.victimCollectionDistance = 0.10
+parameters.sync = False
 ```
 
----
+### `SceneParameters`
 
-#### `StopSimulator()`
+Configures maze generation and starting positions. The defaults generate the approved
+7-by-7 example maze with three victims.
+
+```python
+scene.mazeRows = 7
+scene.mazeColumns = 7
+scene.mazeCellSize = 0.280
+scene.baseCell = (0, 6)
+scene.victimCells = {
+    'L1': (1, 5),
+    'L2': (4, 3),
+    'L3': (6, 0),
+}
+```
+
+## Robot control
+
+### `StartSimulator()`
+
+Stops a running simulation if necessary, regenerates the maze while stopped, places the
+robot and starts the simulation.
+
+### `StopSimulator()`
 
 Stops the CoppeliaSim simulation.
 
-**Returns:** None
+### `SetTargetVelocities(x_dot, theta_dot)`
 
-**Example:**
+Commands forward velocity in metres per second and angular velocity in radians per second.
+
 ```python
-robot.StopSimulator()
+robot.SetTargetVelocities(0.10, 0.0)
+robot.SetTargetVelocities(0.0, 0.3)
+robot.SetTargetVelocities(0.0, 0.0)
 ```
 
----
+## Sensors
 
-### Robot Movement
+### `GetWallDistances()`
 
-#### `SetTargetVelocities(x_dot, theta_dot)`
+Returns robot-relative proximity readings in metres:
 
-Sets the target velocities for robot movement.
-
-**Parameters:**
-- `x_dot` (float): Forward velocity in m/s
-- `theta_dot` (float): Rotational velocity in rad/s
-
-**Returns:** None
-
-**Example:**
-```python
-robot.SetTargetVelocities(0.1, 0.0)    # Move forward at 0.1 m/s
-robot.SetTargetVelocities(0.0, 0.5)    # Rotate at 0.5 rad/s
-robot.SetTargetVelocities(0.1, 0.2)    # Move forward and turn
-robot.SetTargetVelocities(0.0, 0.0)    # Stop
-```
-
----
-
-### Object Detection
-
-#### `GetDetectedObjects(objects=None)`
-
-Gets range and bearing to requested obstacles in the camera's field of view.
-
-**Parameters:**
-- `objects` (list, optional): Obstacle types to detect. If `None`, detects all obstacles.
-
-**Returns:** 
-- `tuple`: Legacy six-value result with `obstaclesRB` in the third position. The retired
-  pick-and-place fields are retained as empty placeholders for compatibility.
-
-**Data Format:**
-Each detection is a `[range, bearing]` array where:
-- `range`: Distance in meters (float)
-- `bearing`: Angle in radians relative to robot's heading (float)
-
-**Example:**
-```python
-# Detect all obstacles
-objects = robot.GetDetectedObjects([warehouseObjects.obstacles])
-_, _, obstacles, _, _, _ = objects
-
-if obstacles:
-    for range_m, bearing_rad in obstacles:
-        print(f"Obstacle detected at {range_m:.2f} m")
-```
-
----
-
-#### `GetCameraImage()`
-
-Gets the current camera image from the robot's vision sensor.
-
-**Returns:**
-- `tuple`: (resolution, image_data)
-  - `resolution` (list): [width, height] of the image
-  - `image_data` (list): Image pixel data, or None if no image available
-
-**Example:**
-```python
-resolution, image_data = robot.GetCameraImage()
-if image_data is not None:
-    width, height = resolution
-    print(f"Got image: {width}x{height} pixels")
-```
-
----
-
-#### `GetWallDistances()`
-
-Reads the three proximity sensors mounted on the robot. Directions are relative to the
-robot's current orientation, and values are measured in metres from each sensor's origin.
-Although named as wall distances for convenience, the sensors can detect any detectable
-scene object in their sensing volume.
-
-**Returns:**
-- `dict`: Keys are `left`, `front`, and `right`. Each value is a distance in metres, or
-  `None` when nothing is detected within that sensor's configured range.
-
-**Example:**
 ```python
 distances = robot.GetWallDistances()
-
-if distances['front'] is None:
-    print('No object detected in front')
-else:
-    print(f"Front distance: {distances['front']:.3f} m")
+left = distances['left']
+front = distances['front']
+right = distances['right']
 ```
 
----
+A value is `None` when the corresponding sensor has no detection. Despite the method name,
+the proximity sensors can detect any detectable object in their sensing volumes.
 
-### Victim Collection
+### `GetCameraImage()`
 
-#### `CollectVictim()`
+Returns `(resolution, image_data)`. Resolution is `[width, height]`; image data is `None`
+when no image is available.
 
-Attempts to collect the nearest generated victim. The library calculates the shortest
-horizontal distance between the victim and the complete robot model only when this method
-is called. Collection succeeds when that clearance is at most
-`robotParameters.victimCollectionDistance` (0.10 m by default) and the robot is not already
-carrying a victim.
+```python
+resolution, image_data = robot.GetCameraImage()
+```
 
-On success, the victim is made static/non-respondable and attached to
-`/Robot/VictimCarryPoint`. The dummy controls where the victim appears on the robot. The
-victim's long axis is rotated horizontally so it can be carried above the robot without
-standing in front of the camera.
+### `GetDetectedObjects(objects=None)`
 
-**Returns:**
-- `tuple`: (success, victim_label, distance)
-  - `success` (bool): True if a victim was collected successfully
-  - `victim_label` (str): `L1`, `L2`, or `L3` after success; otherwise `None`
-  - `distance` (float): Successful collection clearance in metres; otherwise `None`
+Returns optional obstacle detections as `[range, bearing]` pairs. An empty list means no
+requested obstacle was detected.
 
-**Example:**
+```python
+from mazebot_lib import mazeObjects
+
+obstacles = robot.GetDetectedObjects([mazeObjects.obstacles])
+for range_m, bearing_rad in obstacles:
+    print(range_m, bearing_rad)
+```
+
+Available selectors are `mazeObjects.obstacle0`, `mazeObjects.obstacle1`,
+`mazeObjects.obstacle2`, and `mazeObjects.obstacles`.
+
+### `UpdateObjectPositions()`
+
+Refreshes cached robot, camera and optional obstacle positions. It returns
+`(robotPose, obstaclePositions)`.
+
+```python
+robot_pose, obstacle_positions = robot.UpdateObjectPositions()
+```
+
+`robotPose` is `[x, y, theta]` in metres and radians.
+
+### `SetCameraResolution(x_res, y_res)`
+
+Sets the onboard camera resolution and returns `True` when successful.
+
+## Victim collection
+
+### `CollectVictim()`
+
+Attempts to collect the nearest generated victim. Collection succeeds only when the
+shortest horizontal clearance between the robot model and victim is no greater than
+`victimCollectionDistance`, which defaults to 0.10 m.
+
 ```python
 success, victim_label, distance = robot.CollectVictim()
-if success:
-    print(f"Collected victim {victim_label} at {distance:.3f} m")
-else:
-    print("No victim was collected")
 ```
 
----
-#### `HasVictim()`
+On success, the victim is attached to `/Robot/VictimCarryPoint`. The library uses the
+dummy's scene-authored position and orientation without moving the dummy.
 
-Checks if the robot is currently carrying a victim.
+### `HasVictim()`
 
-**Returns:**
-- `bool`: True if the robot is carrying a victim, otherwise False
+Returns `True` while a victim is attached to the robot.
 
-**Example:**
-```python
-if robot.HasVictim():
-    print("Robot is carrying a victim")
-```
+### `ReleaseVictim()`
 
----
+Places the carried victim on the maze floor 0.15 m in front of the robot and returns
+`(success, victim_label)`.
 
-#### `ReleaseVictim()`
-
-Places the carried victim back onto the maze floor, 0.15 m in front of the robot. The
-victim's floor orientation is restored and its lowest bounding-box point is placed 1 mm
-above the floor.
-
-**Returns:**
-
-- `tuple`: (success, victim_label)
-  - `success` (bool): True if the victim was released successfully
-  - `victim_label` (str): The released victim label, or `None` on failure
-
-**Example:**
 ```python
 if robot.HasVictim():
     success, victim_label = robot.ReleaseVictim()
 ```
 
----
+## Keyboard example
 
-### Configuration
+The keyboard example uses held-key input on Windows:
 
-#### `UpdateObjectPositions()`
+- W/S: drive forward or backward
+- A/D: rotate left or right
+- Space: collect a nearby victim or release the carried victim
+- Q: stop and exit
 
-Updates the positions of all objects in the simulation. **This must be called in every control loop.**
-
-**Returns:**
-- `tuple`: (robotPose, itemPositions, obstaclePositions) for debugging purposes
-
-**Example:**
-```python
-while True:
-    # CRITICAL: Always call this in your main loop
-    robot.UpdateObjectPositions()
-    
-    # Rest of your control logic
-    # ...
-```
-
----
-
-#### `SetCameraResolution(x_res, y_res)`
-
-Sets the camera resolution to specific width and height values.
-
-**Parameters:**
-- `x_res` (int): Camera width resolution in pixels
-- `y_res` (int): Camera height resolution in pixels
-
-**Returns:**
-- `bool`: True if successful, False otherwise
-
-**Example:**
-```python
-success = robot.SetCameraResolution(640, 480)
-if success:
-    print("Camera resolution set to 640x480")
-```
-
----
-
-### Object Types
-
-#### `warehouseObjects` (Enum)
-
-Obstacle types retained for the search-and-rescue simulation.
-
-**Obstacle Types:**
-- `warehouseObjects.obstacle0` (6): First obstacle
-- `warehouseObjects.obstacle1` (7): Second obstacle
-- `warehouseObjects.obstacle2` (8): Third obstacle
-
-**Object Groups:**
-- `warehouseObjects.obstacles` (102): All obstacles
-
----
-
-## Examples
-
-### Example 1: Basic Navigation with Obstacle Avoidance
-
-```python
-from warehousebot_lib import *
-import time
-
-# Initialize robot
-robotParameters = RobotParameters()
-sceneParameters = SceneParameters()
-robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
-robot.StartSimulator()
-
-try:
-    while True:
-        robot.UpdateObjectPositions()
-        
-        # Get obstacle detections
-        objects = robot.GetDetectedObjects([warehouseObjects.obstacles])
-        _, _, obstacles, _, _, _ = objects
-        
-        # Simple obstacle avoidance
-        if obstacles and len(obstacles) > 0:
-            print(f"Obstacle detected! Turning away...")
-            robot.SetTargetVelocities(0.0, 0.5)  # Turn right
-        else:
-            print("Clear path, moving forward")
-            robot.SetTargetVelocities(0.2, 0.0)  # Move forward
-        
-        time.sleep(0.1)
-        
-except KeyboardInterrupt:
-    robot.StopSimulator()
-```
-
-### Example 2: Computer Vision Processing
-### Not Necceassary for Navigation
-
-```python
-from warehousebot_lib import *
-import cv2
-import numpy as np
-
-# Initialize robot
-robotParameters = RobotParameters()
-sceneParameters = SceneParameters()
-robot = COPPELIA_WarehouseRobot(robotParameters, sceneParameters)
-robot.StartSimulator()
-
-try:
-    while True:
-        robot.UpdateObjectPositions()
-        
-        # Get camera image
-        resolution, image_data = robot.GetCameraImage()
-        
-        if image_data is not None:
-            # Convert to OpenCV format
-            width, height = resolution
-            image_array = np.array(image_data, dtype=np.uint8)
-            image = image_array.reshape((height, width, 3))
-            image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            
-            # Display image
-            cv2.imshow('Robot Camera', image_bgr)
-            cv2.waitKey(1)
-        
-        time.sleep(0.1)
-        
-except KeyboardInterrupt:
-    cv2.destroyAllWindows()
-    robot.StopSimulator()
-```
+Movement commands are sent only when the held-key state changes. Releasing the movement
+keys sends one zero-velocity command.
 
 ## Troubleshooting
 
-### Connection Issues
+If the Python client cannot connect, confirm that CoppeliaSim is open, the search-and-rescue
+scene is loaded, and the ZeroMQ Remote API is listening on port 23000.
 
-**Problem:** "Failed to connect to CoppeliaSim"
-- **Solution:** Ensure CoppeliaSim is running and the correct scene is loaded
-- **Check:** Verify ZMQ Remote API is enabled in CoppeliaSim
-
-**Problem:** "Port 23000 connection failed"
-- **Solution:** Check if another program is using the port
-- **Alternative:** Check which port number coppeliaSim is using as it may have changed from the default
-
-### Detection Issues
-
-**Problem:** No objects detected
-- **Solution:** Always call `UpdateObjectPositions()` in your main loop
-- **Check:** Verify objects are within detection ranges
-- **Debug:** Use `GetCameraImage()` to verify camera is working and camera position is correct
-
-**Problem:** Objects detected incorrectly
-- **Solution:** Check robot parameter detection distances
-- **Calibration:** Adjust camera pose and orientation settings
-
-### Movement Issues
-
-**Problem:** Robot not moving
-- **Solution:** Check velocity values are within speed limits
-- **Verify:** Ensure simulation is running (not paused)
-- **Debug:** Test with small velocity values first
-
-**Problem:** Robot moving erratically
-- **Solution:** Reduce maximum speed parameters
-- **Check:** Ensure `UpdateObjectPositions()` is called regularly
-
-### Installation Issues
-
-**Problem:** "No module named 'coppeliasim_zmqremoteapi_client'"
-- **Solution:** Install using pip: `pip install coppeliasim-zmqremoteapi-client`
-- **Alternative:** Try `python3 -m pip install coppeliasim-zmqremoteapi-client`
-
-**Problem:** ImportError with other dependencies
-- **Solution:** Install all required packages: `pip install opencv-python pygame numpy`
-
+If an optional sensor is missing, the library reports it during initialization and keeps the
+remaining functionality available. Required robot, motor, floor and maze-template objects
+must use the paths expected by `mazebot_lib.py`.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-For technical support:
-- Check the [Troubleshooting](#troubleshooting) section
-- Review the [Examples](#examples) for common use cases
-- Contact course instructors for EGB320-specific questions
-
-## Changelog
-
-### Version 1.0.0
-- Initial release with full warehouse robot functionality
-- Support for CoppeliaSim ZMQ Remote API
-- Comprehensive object detection and navigation capabilities
-- Item collection and delivery system
+See [LICENSE](LICENSE).

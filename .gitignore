@@ -1,3 +1,2 @@
-__pycache__/EGB320_CoppeliaSim_Example_keyboard.cpython-314.pyc
-__pycache__/EGB320_CoppeliaSim_Example.cpython-314.pyc
-__pycache__/warehousebot_lib.cpython-314.pyc
+__pycache__/
+*.pyc
