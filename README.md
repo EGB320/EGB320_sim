@@ -168,8 +168,15 @@ scene_parameters.robotStartingPosition = [0.0, 0.0, 0.0]
 robot = MazeBot(robot_parameters, scene_parameters)
 ```
 
-The default maze is 7 by 7 cells and contains three victim objects. Maze walls and victims
-are regenerated whenever `StartSimulator()` is called.
+The default maze is 7 by 7 cells and contains three victim objects. Each victim is placed
+in a dead end with its wall marker directly beyond it on the terminal wall, allowing an
+approaching robot to see both at once. Maze walls and victims are regenerated whenever
+`StartSimulator()` is called.
+
+The base station is itself a dead end. The robot begins facing a four-cell straight
+corridor whose first junction is at `(0, 2)`: continuing straight enters the wider maze,
+while the first right turn leads directly into the L1 victim's dead end at `(1, 2)`.
+The physically open routes to L2 and L3 avoid the remaining central diagonal-wall cells.
 
 ## Optional object selection
 

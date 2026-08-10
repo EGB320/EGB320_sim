@@ -48,19 +48,23 @@ def show_status(command, walls, detections, collection_status):
         f"front={format_distance(walls['front'])}, "
         f"right={format_distance(walls['right'])}")
 
-    visible_markers = [
-        name for name in ('base', 'victim', 'rubble_victim', 'hazard')
-        if detections[name]
-    ]
-    print('wall markers:', ', '.join(visible_markers) or 'none')
-
-    if detections['victim_object']:
-        range_m, bearing_rad = detections['victim_object'][0]
-        print(
-            f'yellow victim: {range_m:.3f} m, '
-            f'{math.degrees(bearing_rad):.1f} degrees')
+    if detections is None:
+        print('wall markers: detection camera disabled')
+        print('yellow victim: detection camera disabled')
     else:
-        print('yellow victim: none')
+        visible_markers = [
+            name for name in ('base', 'victim', 'rubble_victim', 'hazard')
+            if detections[name]
+        ]
+        print('wall markers:', ', '.join(visible_markers) or 'none')
+
+        if detections['victim_object']:
+            range_m, bearing_rad = detections['victim_object'][0]
+            print(
+                f'yellow victim: {range_m:.3f} m, '
+                f'{math.degrees(bearing_rad):.1f} degrees')
+        else:
+            print('yellow victim: none')
 
     print('collection:', collection_status)
 
@@ -99,6 +103,12 @@ def main():
                 # Update the robot pose, then read the distance and object sensors.
                 robot.UpdateObjectPositions()
                 walls = robot.GetWallDistances()
+
+                # GetDetections() uses the low-resolution detection camera, but rendering
+                # that camera still slows the simulation. If detections are not yet needed
+                # by your navigation system, leave `detections` as None and comment out the
+                # GetDetections() line until you need marker or victim detections.
+                detections = None
                 detections = robot.GetDetections()
 
                 # OPTIONAL: Read the full colour image from the VisionSensor camera.

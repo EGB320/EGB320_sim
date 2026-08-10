@@ -8,7 +8,6 @@ the public API section implements scene generation and does not need to be modif
 import math
 import random
 import time
-from collections import deque
 from enum import IntEnum
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
@@ -17,7 +16,7 @@ from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 # Deterministic example maze layout: internal wall segments between grid
 # intersections. Each entry is ((startColumn, startRow), (endColumn, endRow)) using the
 # grid intersection convention described in SetScene/_grid_point_to_world. Intentionally
-# not merged/optimised - this should always produce exactly 40 internal wall copies.
+# not merged/optimised so each entry corresponds to one generated internal wall copy.
 EXAMPLE_MAZE_SEGMENTS = [
 	((4, 0), (4, 1)),
 
@@ -26,8 +25,6 @@ EXAMPLE_MAZE_SEGMENTS = [
 
 	((3, 1), (3, 2)),
 	((3, 2), (3, 3)),
-	((3, 1), (4, 2)),
-	((4, 2), (5, 1)),
 
 	((5, 1), (6, 1)),
 	((6, 1), (6, 2)),
@@ -37,8 +34,9 @@ EXAMPLE_MAZE_SEGMENTS = [
 	((5, 2), (5, 3)),
 	((5, 3), (5, 4)),
 
-	((0, 2), (1, 2)),
 	((1, 2), (2, 2)),
+	((1, 3), (2, 3)),
+	((2, 2), (2, 3)),
 
 	((3, 2), (4, 2)),
 	((4, 2), (5, 2)),
@@ -53,7 +51,8 @@ EXAMPLE_MAZE_SEGMENTS = [
 
 	((3, 4), (4, 3)),
 
-	((1, 4), (2, 4)),
+	# Keep the long starting corridor separate from the cells immediately to its east.
+	((1, 4), (1, 5)),
 
 	((3, 4), (4, 4)),
 	((4, 4), (5, 4)),
@@ -64,7 +63,6 @@ EXAMPLE_MAZE_SEGMENTS = [
 
 	((1, 5), (1, 6)),
 	((1, 6), (1, 7)),
-
 	((4, 5), (4, 6)),
 
 	((5, 4), (5, 5)),
@@ -74,8 +72,6 @@ EXAMPLE_MAZE_SEGMENTS = [
 	((4, 6), (5, 6)),
 	((5, 6), (6, 6)),
 
-	((1, 6), (2, 7)),
-	((2, 7), (3, 6)),
 	((3, 6), (3, 7)),
 ]
 
@@ -1486,34 +1482,6 @@ class MazeBot(object):
 			for side in ('N', 'E', 'S', 'W')
 		}
 
-	def _shortest_path_entry_directions(self):
-		"""Return the movement direction used to first enter each cell from the base cell."""
-		directionSteps = {
-			'N': (0, -1),
-			'E': (1, 0),
-			'S': (0, 1),
-			'W': (-1, 0),
-		}
-		baseCell = tuple(self.sceneParameters.baseCell)
-		queue = deque([baseCell])
-		visited = {baseCell}
-		entryDirections = {}
-
-		while queue:
-			cell = queue.popleft()
-			wallSides = self._cell_wall_sides(cell)
-			for direction, (columnStep, rowStep) in directionSteps.items():
-				if wallSides[direction]:
-					continue
-				neighbour = (cell[0] + columnStep, cell[1] + rowStep)
-				if neighbour in visited:
-					continue
-				visited.add(neighbour)
-				entryDirections[neighbour] = direction
-				queue.append(neighbour)
-
-		return entryDirections
-
 	def _plan_marker_walls(self):
 		"""
 		Choose marker-bearing wall segments for the base, victims and empty dead ends.
@@ -1566,21 +1534,18 @@ class MazeBot(object):
 			baseMarkerSide = baseBoundarySides[0]
 		assign('base', baseCell, baseMarkerSide, self.baseStationWallTemplateHandle, 'EGB320_GEN_BASE_STATION_WALL')
 
-		# Prefer a wall directly ahead on the shortest route from base. If that side is open
-		# (e.g. a victim in a through corridor), use a deterministic existing side wall.
-		entryDirections = self._shortest_path_entry_directions()
+		# Victims must occupy three-sided dead ends. Put each marker on the terminal wall
+		# opposite the sole opening so an approaching robot sees the marker above the victim.
 		victimCells = {tuple(cell) for cell in self.sceneParameters.victimCells.values()}
 		for label, configuredCell in self.sceneParameters.victimCells.items():
 			cell = tuple(configuredCell)
 			wallSides = self._cell_wall_sides(cell)
-			approachDirection = entryDirections.get(cell)
-			candidateSides = []
-			for side in (approachDirection, 'E', 'W', 'S', 'N'):
-				if side is not None and side not in candidateSides:
-					candidateSides.append(side)
-			markerSide = next((side for side in candidateSides if wallSides[side]), None)
-			if markerSide is None:
-				raise ValueError(f"Victim '{label}' at cell {cell} has no wall for its marker")
+			openSides = [side for side, closed in wallSides.items() if not closed]
+			if len(openSides) != 1:
+				raise ValueError(
+					f"Victim '{label}' at cell {cell} must be in a dead end "
+					f"(found open sides: {openSides})")
+			markerSide = oppositeDirection[openSides[0]]
 
 			isLevel3 = str(label).upper() == 'L3'
 			templateHandle = self.rubbleVictimWallTemplateHandle if isLevel3 else self.victimWallTemplateHandle
@@ -2262,10 +2227,12 @@ class SceneParameters(object):
 		self.generateMazeObjects = True
 		self.baseCell = (0, 6)
 		self.baseYaw = math.pi / 2
+		# Each victim is in a three-sided dead end. The associated marker is generated on
+		# the terminal wall opposite the one open side (see _plan_marker_walls).
 		self.victimCells = {
-			"L1": (1, 5),
-			"L2": (4, 3),
-			"L3": (6, 0),
+			"L1": (1, 2),
+			"L2": (5, 1),
+			"L3": (4, 5),
 		}
 		self.placeRobotAtBase = True
 
@@ -2305,6 +2272,11 @@ class SceneParameters(object):
 
 		maxCellColumnIndex = self.mazeColumns - 1
 		maxCellRowIndex = self.mazeRows - 1
+		axisAlignedWalls = {
+			tuple(sorted((tuple(startPoint), tuple(endPoint))))
+			for startPoint, endPoint in EXAMPLE_MAZE_SEGMENTS
+			if startPoint[0] == endPoint[0] or startPoint[1] == endPoint[1]
+		}
 		seenCells = set()
 		for label, cell in self.victimCells.items():
 			column, row = cell
@@ -2315,6 +2287,27 @@ class SceneParameters(object):
 			if cell in seenCells:
 				raise ValueError(f"Victim cells must be unique - duplicate cell {cell}")
 			seenCells.add(cell)
+
+			cellSideSegments = {
+				'N': ((column, row), (column + 1, row)),
+				'E': ((column + 1, row), (column + 1, row + 1)),
+				'S': ((column, row + 1), (column + 1, row + 1)),
+				'W': ((column, row), (column, row + 1)),
+			}
+			boundarySides = {
+				'N': row == 0,
+				'E': column == maxCellColumnIndex,
+				'S': row == maxCellRowIndex,
+				'W': column == 0,
+			}
+			openSides = [
+				side for side, segment in cellSideSegments.items()
+				if not boundarySides[side] and tuple(sorted(segment)) not in axisAlignedWalls
+			]
+			if len(openSides) != 1:
+				raise ValueError(
+					f"Victim '{label}' at cell {cell} must be in a dead end with exactly "
+					f"one open side (found open sides: {openSides})")
 
 		if tuple(self.baseCell) in seenCells:
 			raise ValueError(f"baseCell {self.baseCell} must not coincide with a victim cell")

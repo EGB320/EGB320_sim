@@ -32,7 +32,11 @@ def main():
             # that the sensor did not detect anything within its range.
             walls = robot.GetWallDistances()
 
-            # Read marker and yellow-victim detections from the small object detector.
+            # GetDetections() uses the low-resolution detection camera, but rendering
+            # that camera still slows the simulation. If detections are not yet needed
+            # by your navigation system, leave `detections` as None and comment out the
+            # GetDetections() line until you need marker or victim detections.
+            detections = None
             detections = robot.GetDetections()
 
             print(f"pose: {pose}")
