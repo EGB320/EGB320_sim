@@ -52,7 +52,7 @@ function sysCall_vision(inData)
         {1.00, 1.00, 0.00}, {0.60, 0.60, 0.12}, 0.002) and 1 or 0
 
     -- Restore the original image. Adding buffer1 to the last binary mask caused the
-    -- old script's displayed detector image to clip and show false colours.
+    -- binary mask to clip and show false colours.
     simVision.buffer1ToWorkImg(inData.handle)
     simVision.workImgToSensorImg(inData.handle)
 

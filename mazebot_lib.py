@@ -1,63 +1,20 @@
-# Import required Python modules
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
-import time
+"""
+Python interface for the 2026 EGB320 CoppeliaSim search-and-rescue maze.
+
+Students should start with :class:`MazeBot` and the two example programs. Most code below
+the public API section implements scene generation and does not need to be modified.
+"""
+
 import math
-import numpy as np
-import sys
+import random
+import time
 from collections import deque
 from enum import IntEnum
 
-"""
-EGB320 Search and Rescue MazeBot Library (2026)
-
-This library provides a Python interface for controlling the EGB320 maze robot in CoppeliaSim.
-
-As of this phase, the library targets the 2026 search and rescue maze challenge. It uses
-the CoppeliaSim ZeroMQ Python remote API to deterministically generate a 7x7 cell maze
-(walls, corner posts) and place three victim objects.
-
-MAIN FUNCTIONS:
-===========================
-
-Robot Control:
-- StartSimulator() / StopSimulator()    : Start/stop the simulation (generates the maze while stopped)
-- SetTargetVelocities(x_dot, theta_dot) : Set robot movement velocities
-- UpdateObjectPositions()               : Update object positions (call this every loop!)
-
-Object Detection:
-- GetDetectedObjects(objects)           : Get range/bearing to obstacles, victims or wall markers
-- GetDetectedMarkers()                  : Get wall-marker and yellow-victim detections by type
-- GetDetectedVictims()                  : Get range/bearing to a visible victim
-- GetCameraImage()                      : Get camera image for computer vision
-- GetWallDistances()                    : Get robot-relative left/front/right proximity readings
-
-Victim Collection:
-- CollectVictim()                       : Attempt to collect a victim within 0.10 m
-- ReleaseVictim()                       : Place the carried victim on the ground
-- HasVictim()                           : Check whether the robot is carrying a victim
-
-Configuration:
-- SetCameraResolution(x_res, y_res)    : Set camera resolution
-
-EXAMPLE USAGE:
-=============
-# Initialize robot
-robot = COPPELIA_MazeRobot(robotParameters, sceneParameters)
-robot.StartSimulator()  # generates the maze, then starts the simulation
-
-# Main control loop
-while True:
-    # Move robot
-    robot.SetTargetVelocities(0.1, 0.0)  # Move forward at 0.1 m/s
-    
-    # Update positions (important!)
-    robot.UpdateObjectPositions()
-
-For more examples, see EGB320_CoppeliaSim_Example.py
-"""
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 
-# Deterministic example maze layout (Phase 1): internal wall segments between grid
+# Deterministic example maze layout: internal wall segments between grid
 # intersections. Each entry is ((startColumn, startRow), (endColumn, endRow)) using the
 # grid intersection convention described in SetScene/_grid_point_to_world. Intentionally
 # not merged/optimised - this should always produce exactly 40 internal wall copies.
@@ -147,7 +104,8 @@ DETECTOR_MARKER_FACE_OFFSET = 0.0002
 
 
 # Object types retained for the search-and-rescue challenge.
-class mazeObjects(IntEnum):
+class MazeObject(IntEnum):
+	"""Object categories accepted by :meth:`MazeBot.GetDetectedObjects`."""
 	# Obstacle objects
 	obstacle0 = 0
 	obstacle1 = 1
@@ -167,11 +125,15 @@ class mazeObjects(IntEnum):
 	victims = 102
 
 
+# Keep the earlier enum name working for existing teaching material.
+mazeObjects = MazeObject
+
+
 ################################
 ##### MAZE BOT CLASS #####
 ################################
 
-class COPPELIA_MazeRobot(object):
+class MazeBot(object):
 	"""
 	Main class for controlling the search-and-rescue maze robot in CoppeliaSim.
 	This class provides robot navigation, sensing, maze generation and victim collection.
@@ -181,21 +143,24 @@ class COPPELIA_MazeRobot(object):
 	#### MAZE BOT INITIALIZATION ###
 	####################################
 
-	def __init__(self, robotParameters, sceneParameters, coppelia_server_ip='127.0.0.1', port=23000):
+	def __init__(self, robotParameters=None, sceneParameters=None,
+			coppelia_server_ip='127.0.0.1', port=23000):
 		"""
 		Initialize the maze robot connection to CoppeliaSim.
 		
 		Args:
-			robotParameters: RobotParameters object with robot configuration
-			sceneParameters: SceneParameters object with scene configuration
+			robotParameters: Optional RobotParameters configuration. Defaults are used when omitted.
+			sceneParameters: Optional SceneParameters configuration. Defaults are used when omitted.
 			coppelia_server_ip: IP address of CoppeliaSim server (default: '127.0.0.1')
 			port: Port number for ZMQ Remote API (default: 23000)
 		"""
 		print("Initializing maze robot connection...")
 		
 		# Store parameters
-		self.robotParameters = robotParameters
-		self.sceneParameters = sceneParameters
+		self.robotParameters = (
+			RobotParameters() if robotParameters is None else robotParameters)
+		self.sceneParameters = (
+			SceneParameters() if sceneParameters is None else sceneParameters)
 		self.port = port
 
 		# Initialize wheel bias for drive system simulation
@@ -203,7 +168,6 @@ class COPPELIA_MazeRobot(object):
 		self.rightWheelBias = 0
 
 		# CoppeliaSim connection variables
-		self.clientID = None
 		self.client = None
 		self.sim = None
 
@@ -217,18 +181,14 @@ class COPPELIA_MazeRobot(object):
 		self.rightMotorHandle = None
 		self.leftRearMotorHandle = None
 		self.rightRearMotorHandle = None
-		self.v60MotorHandle = None
-		self.v180MotorHandle = None
-		self.v300MotorHandle = None
 		self.obstacleHandles = [None, None, None]
-		self.proximityHandle = None
 		self.distanceSensorHandles = {
 			'left': None,
 			'front': None,
 			'right': None,
 		}
 
-		# Search and rescue maze scene object handles (essential for this phase)
+		# Search-and-rescue maze scene object handles
 		self.floorHandle = None
 		self.tableWallHandles = []
 		self.mazeWallTemplateHandle = None
@@ -238,8 +198,6 @@ class COPPELIA_MazeRobot(object):
 		self.hazardWallTemplateHandle = None
 		self.wallPostTemplateHandle = None
 		self.victimTemplateHandle = None
-		self.markerPlaneTemplateHandles = {}
-		self.detectorMarkerPlaneTemplateHandles = {}
 
 		# Generated maze object bookkeeping (used for cleanup on regeneration)
 		self.generatedSceneRootHandle = None
@@ -260,7 +218,6 @@ class COPPELIA_MazeRobot(object):
 		self.floorTopZ = None
 		self.mazeXMinimum = None
 		self.mazeYMaximum = None
-		self.mazeWallTemplateSize = None
 		self.wallTemplateGeometry = {}
 		self.wallPostTemplateSize = None
 		self.wallPostTemplateOrientation = None
@@ -272,11 +229,9 @@ class COPPELIA_MazeRobot(object):
 
 		# Wheel bias simulation for imperfect drive systems
 		if self.robotParameters.driveSystemQuality != 1:
-			self.leftWheelBias = np.random.normal(0, (1-self.robotParameters.driveSystemQuality)*0.2, 1)
-			self.rightWheelBias = np.random.normal(0, (1-self.robotParameters.driveSystemQuality)*0.2, 1)
-
-		# Physical parameters
-		self.obstacleSize = 0.18  # diameter of obstacle in meters
+			biasStandardDeviation = (1 - self.robotParameters.driveSystemQuality) * 0.2
+			self.leftWheelBias = random.gauss(0.0, biasStandardDeviation)
+			self.rightWheelBias = random.gauss(0.0, biasStandardDeviation)
 
 		# Object position variables
 		self.robotPose = None
@@ -292,7 +247,7 @@ class COPPELIA_MazeRobot(object):
 		print("Getting simulation object handles...")
 		self.GetCOPPELIAObjectHandles()
 		if self.missingOptionalObjects:
-			print(f"Optional objects not found (safe to ignore for this phase): {', '.join(self.missingOptionalObjects)}")
+			print(f"Optional objects not found: {', '.join(self.missingOptionalObjects)}")
 
 		# Configure robot parameters
 		print("Configuring robot parameters...")
@@ -325,9 +280,6 @@ class COPPELIA_MazeRobot(object):
 					time.sleep(0.05)
 				print('Simulation stopped.')
 
-			if self.robotParameters.sync:
-				print('Setting synchronous mode (may cause issues - consider setting sync=False)')
-				self.sim.setStepping(True)
 		except Exception as e:
 			print(f'Error checking/stopping simulation state: {e}')
 
@@ -338,9 +290,9 @@ class COPPELIA_MazeRobot(object):
 			self.sim.startSimulation()
 			print('CoppeliaSim simulation started successfully.')
 		except Exception as e:
-			print(f'Error starting simulation: {e}')
-			print('Try starting the simulation manually by pressing Play in CoppeliaSim.')
-			sys.exit(-1)
+			raise RuntimeError(
+				'Could not start CoppeliaSim. You can also try the Play button '
+				'in CoppeliaSim.') from e
 
 		time.sleep(1)
 		self.GetObjectPositions()
@@ -404,10 +356,10 @@ class COPPELIA_MazeRobot(object):
 	def _marker_selector_map():
 		"""Map public marker selectors to internal maze-generation marker kinds."""
 		return {
-			mazeObjects.baseStationMarker: 'base',
-			mazeObjects.victimMarker: 'victim',
-			mazeObjects.rubbleVictimMarker: 'rubble_victim',
-			mazeObjects.hazardMarker: 'hazard',
+			MazeObject.baseStationMarker: 'base',
+			MazeObject.victimMarker: 'victim',
+			MazeObject.rubbleVictimMarker: 'rubble_victim',
+			MazeObject.hazardMarker: 'hazard',
 		}
 
 	def _get_marker_detections_from_packet(self, objectsDetected, requestedMarkerTypes=None):
@@ -416,10 +368,9 @@ class COPPELIA_MazeRobot(object):
 		requestedMarkerTypes = set(markerSelectorMap) if requestedMarkerTypes is None else set(requestedMarkerTypes)
 		markerDetections = {kind: [] for kind in markerSelectorMap.values()}
 
-		# New packet: [obstacle0, obstacle1, obstacle2, base marker, victim marker,
-		# rubble-victim marker, hazard marker, victim object]. Legacy 23-value
-		# warehouse packets have no marker flags.
-		if len(objectsDetected) < 7 or len(objectsDetected) >= 9:
+		# Packet: [obstacle0, obstacle1, obstacle2, base marker, victim marker,
+		# rubble-victim marker, hazard marker, victim object].
+		if len(objectsDetected) != 8:
 			return markerDetections
 
 		for markerSelector, kind in markerSelectorMap.items():
@@ -447,28 +398,28 @@ class COPPELIA_MazeRobot(object):
 		
 		Args:
 			objects: List containing obstacle/victim/marker selectors or group selectors.
-				Defaults to all obstacles for backwards compatibility.
+				Defaults to all optional obstacles.
 			
 		Returns:
-			list: Requested detections as [range, bearing] pairs. Use GetDetectedMarkers()
+			list: Requested detections as [range, bearing] pairs. Use GetDetections()
 				when marker type labels need to be retained in a mixed query.
 		"""
 		# Default to detecting all obstacles if none are specified.
 		if objects is None:
-			objects = [mazeObjects.obstacles]
+			objects = [MazeObject.obstacles]
 
 		requestedObjects = set(objects)
 		obstacleTypes = (
-			mazeObjects.obstacle0,
-			mazeObjects.obstacle1,
-			mazeObjects.obstacle2,
+			MazeObject.obstacle0,
+			MazeObject.obstacle1,
+			MazeObject.obstacle2,
 		)
-		detectAllObstacles = mazeObjects.obstacles in requestedObjects
+		detectAllObstacles = MazeObject.obstacles in requestedObjects
 		markerSelectorMap = self._marker_selector_map()
-		detectAllMarkers = mazeObjects.markers in requestedObjects
+		detectAllMarkers = MazeObject.markers in requestedObjects
 		detectVictims = (
-			mazeObjects.victim in requestedObjects or
-			mazeObjects.victims in requestedObjects)
+			MazeObject.victim in requestedObjects or
+			MazeObject.victims in requestedObjects)
 		requestedMarkerTypes = {
 			selector for selector in markerSelectorMap
 			if detectAllMarkers or selector in requestedObjects
@@ -487,16 +438,13 @@ class COPPELIA_MazeRobot(object):
 
 		obstaclesRangeBearing = []
 		if objectsDetected:
-			# New maze-only detector scripts use indices 0-2. Accept the previous 6-8
-			# layout as well so existing scene sensor scripts continue to work.
-			detectorIndexOffset = 6 if len(objectsDetected) >= 9 else 0
 			for index, obstaclePosition in enumerate(self.obstaclePositions):
 				if not detectAllObstacles and obstacleTypes[index] not in requestedObjects:
 					continue
 				if obstaclePosition is not None:
 					result = self._process_single_object_detection(
 						obstaclePosition,
-						detectorIndexOffset + index,
+						index,
 						objectsDetected,
 						self.robotParameters.maxObstacleDetectionDistance)
 					if result is not None:
@@ -515,7 +463,7 @@ class COPPELIA_MazeRobot(object):
 
 	def _get_victim_detections_from_packet(self, objectsDetected):
 		"""Return the closest visible, uncollected victim reported by the detector."""
-		victimDetectionIndex = int(mazeObjects.victim)
+		victimDetectionIndex = int(MazeObject.victim)
 		if not self._is_object_detected(objectsDetected, victimDetectionIndex):
 			return []
 
@@ -550,7 +498,7 @@ class COPPELIA_MazeRobot(object):
 		return self._get_victim_detections_from_packet(
 			self._read_object_detector_packet())
 
-	def GetDetectedMarkers(self):
+	def GetDetections(self):
 		"""
 		Detect the four wall-marker types and yellow victim objects with one sensor update.
 
@@ -577,6 +525,10 @@ class COPPELIA_MazeRobot(object):
 			objectsDetected)
 		return detections
 
+	def GetDetectedMarkers(self):
+		"""Compatibility name for :meth:`GetDetections`."""
+		return self.GetDetections()
+
 
 	def GetCameraImage(self):
 		"""
@@ -602,21 +554,6 @@ class COPPELIA_MazeRobot(object):
 			print(f"Error getting camera image: {e}")
 			return None, None
 	
-	def GetDetectedWallPoints(self):
-		"""
-		Legacy compatibility stub; wall-point estimation is not supported for the 2026 maze.
-
-		The previous boundary-only implementation intersected the camera field-of-view with
-		four fixed, axis-aligned arena boundaries. It does not account for generated internal
-		maze walls or diagonal wall segments and therefore produced misleading readings.
-		Use GetWallDistances() for the robot-relative proximity sensors instead. A future
-		version may replace this stub with geometry-based or vision-based wall detection.
-
-		Returns:
-			None: Always, while maze wall-point detection is unsupported.
-		"""
-		return None
-
 	def GetWallDistances(self):
 		"""
 		Read the three robot-relative proximity sensors.
@@ -678,8 +615,9 @@ class COPPELIA_MazeRobot(object):
 
 			# Add noise if drive system quality is not perfect
 			if self.robotParameters.driveSystemQuality != 1:
-				leftWheelSpeed = np.random.normal(leftWheelSpeed, (1-self.robotParameters.driveSystemQuality)*1, 1)[0]
-				rightWheelSpeed = np.random.normal(rightWheelSpeed, (1-self.robotParameters.driveSystemQuality)*1, 1)[0]
+				noiseStandardDeviation = 1 - self.robotParameters.driveSystemQuality
+				leftWheelSpeed = random.gauss(leftWheelSpeed, noiseStandardDeviation)
+				rightWheelSpeed = random.gauss(rightWheelSpeed, noiseStandardDeviation)
 
 			# Limit wheel speeds to +/- maxWheelSpeed (both directions - forward and reverse)
 			leftWheelSpeed = max(min(leftWheelSpeed, maxWheelSpeed), -maxWheelSpeed)
@@ -902,13 +840,9 @@ class COPPELIA_MazeRobot(object):
 				print('Simulation is running.')
 			
 		except Exception as e:
-			print(f'Failed to connect to CoppeliaSim: {e}')
-			print('Make sure CoppeliaSim is running with the correct scene loaded.')
-			print('\nTroubleshooting steps:')
-			print('1. Restart CoppeliaSim')
-			print('2. Load your scene file')
-			print('3. Check that ZMQ Remote API is enabled')
-			sys.exit(-1)
+			raise ConnectionError(
+				'Could not connect to CoppeliaSim. Confirm that the simulator is '
+				'running, the 2026 scene is loaded, and the ZeroMQ Remote API is enabled.') from e
 
 	def _try_get_object(self, path):
 		"""Attempt to resolve a scene object path without raising. Returns the handle, or None if not found."""
@@ -952,38 +886,35 @@ class COPPELIA_MazeRobot(object):
 		Resolve object handles needed for the search and rescue maze scene.
 
 		Only the robot, drive motors, floor, table boundary walls, and the maze/post/victim
-		templates are required in this phase - startup aborts if any of these are missing.
-		Robot sensors (vision sensor, object detector, proximity/distance sensors and rear
+		templates are required; startup aborts if any of these are missing.
+		Robot sensors (vision sensor, object detector, distance sensors and rear
 		motors) are optional and resolved best-effort. Optional obstacles never abort startup.
 		"""
 		# --- Essential: robot + drive motors ---
 		errorCode = self.GetRobotHandle()
 		if errorCode != 0:
-			print('Failed to get Robot object handle.')
-			sys.exit(-1)
+			raise RuntimeError("Required scene object '/Robot' was not found.")
 
 		errorCode = self.GetScriptHandle()
 		if errorCode != 0:
-			print('Failed to get Script handle.')
-			sys.exit(-1)
+			raise RuntimeError("The simulation script attached to '/Robot' was not found.")
 
 		errorCode1, errorCode2, errorCode3, errorCode4 = self.GetMotorHandles()
 		if errorCode1 != 0 or errorCode2 != 0:
-			print('Failed to get drive Motor handles.')
-			sys.exit(-1)
+			raise RuntimeError('Required left/right drive motors were not found.')
 		elif errorCode3 != 0 or errorCode4 != 0:
 			print("Note: rear wheel motors not found (fine for two-wheel differential robots).")
 
 		# --- Essential: search and rescue maze scene objects ---
 		self.floorHandle = self._resolve_first_available(['/floor'], 'floor', required=True)
 		if self.floorHandle is None:
-			sys.exit(-1)
+			raise RuntimeError("Required scene object '/floor' was not found.")
 
 		self.tableWallHandles = []
 		for i in range(4):
 			handle = self._resolve_first_available([f'/table_wall[{i}]'], f'table_wall[{i}]', required=True)
 			if handle is None:
-				sys.exit(-1)
+				raise RuntimeError(f"Required scene object '/table_wall[{i}]' was not found.")
 			self.tableWallHandles.append(handle)
 
 		self.mazeWallTemplateHandle = self._resolve_first_available(['/maze_wall'], 'maze_wall template', required=True)
@@ -1005,7 +936,7 @@ class COPPELIA_MazeRobot(object):
 			self.hazardWallTemplateHandle,
 		)
 		if any(handle is None for handle in wallTemplateHandles) or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
-			sys.exit(-1)
+			raise RuntimeError('One or more required maze template objects were not found.')
 
 		# Colour only each child marker plane. The white structural wall remains unchanged.
 		self._configure_marker_template_planes()
@@ -1014,7 +945,6 @@ class COPPELIA_MazeRobot(object):
 		self.GetVictimCarryPointHandle()
 		self.GetCameraHandle()
 		self.GetObjectDetectorHandle()
-		self.getProximityhandle()
 		self.GetDistanceSensorHandles()
 
 		# Optional maze obstacles are best-effort and never abort startup.
@@ -1112,12 +1042,6 @@ class COPPELIA_MazeRobot(object):
 			print(f"Optional obstacles not found: {', '.join(missing)}")
 		return tuple(error_codes)
 
-	# Get ZMQ proximity sensor handle.
-	def getProximityhandle(self):
-		self.proximityHandle = self._resolve_first_available(
-			['/Robot/VisionSensor/Proximity_sensor', '/Proximity_sensor'], 'Proximity_sensor', required=False)
-		return 0 if self.proximityHandle is not None else -1
-
 	def GetDistanceSensorHandles(self):
 		"""Resolve the optional robot-relative left, front and right proximity sensors."""
 		for direction, suffix in (('left', 'Left'), ('front', 'Front'), ('right', 'Right')):
@@ -1177,11 +1101,7 @@ class COPPELIA_MazeRobot(object):
 			print('autoGenerateMaze is False - skipping maze generation.')
 			return
 
-		try:
-			self.sceneParameters.validate_maze_parameters()
-		except ValueError as e:
-			print(f"Error: invalid maze configuration: {e}")
-			sys.exit(-1)
+		self.sceneParameters.validate_maze_parameters()
 
 		if self.sceneParameters.clearGeneratedMaze:
 			removedCount = self._clear_generated_maze()
@@ -1292,8 +1212,7 @@ class COPPELIA_MazeRobot(object):
 				f"Error: /floor is not aligned with the world X/Y plane (roll={floorOrientation[0]:.4f}, "
 				f"pitch={floorOrientation[1]:.4f} rad). Maze generation assumes an axis-aligned floor."
 			)
-			print(floorErrorMessage)
-			sys.exit(-1)
+			raise ValueError(floorErrorMessage)
 		if abs(self.WrapToPi(floorOrientation[2])) > orientationTolerance:
 			floorYawWarning = (
 				f"Warning: /floor yaw is {floorOrientation[2]:.4f} rad - the maze grid follows the floor's "
@@ -1383,14 +1302,6 @@ class COPPELIA_MazeRobot(object):
 			for name, handle in wallTemplates.items()
 		}
 
-		mazeWallGeometry = self.wallTemplateGeometry[self.mazeWallTemplateHandle]
-		self.mazeWallTemplateSize = mazeWallGeometry['size']
-		self.mazeWallTemplateOrientation = mazeWallGeometry['orientation']
-		self.mazeWallHeightAxisIndex = mazeWallGeometry['heightAxisIndex']
-		self.mazeWallLengthAxisIndex = mazeWallGeometry['lengthAxisIndex']
-		self.mazeWallWorldHeight = mazeWallGeometry['worldHeight']
-		self.mazeWallLengthAxisBaseYaw = mazeWallGeometry['lengthAxisBaseYaw']
-
 		self.wallPostTemplateSize = self._get_shape_bbox_size(self.wallPostTemplateHandle)
 		self.wallPostTemplateOrientation = self.sim.getObjectOrientation(self.wallPostTemplateHandle, -1)
 		try:
@@ -1473,8 +1384,6 @@ class COPPELIA_MazeRobot(object):
 			'rubble_victim': self.rubbleVictimWallTemplateHandle,
 			'hazard': self.hazardWallTemplateHandle,
 		}
-		self.markerPlaneTemplateHandles = {}
-		self.detectorMarkerPlaneTemplateHandles = {}
 		for kind, wallModelHandle in templates.items():
 			markerPlaneHandle = self._find_marker_plane(wallModelHandle)
 			detectorMarkerHandle = self._ensure_detector_marker_plane(
@@ -1507,9 +1416,6 @@ class COPPELIA_MazeRobot(object):
 				None,
 				self.sim.colorcomponent_emission,
 				list(MARKER_EMISSIVE_COLOURS[kind]))
-			self.markerPlaneTemplateHandles[kind] = markerPlaneHandle
-			self.detectorMarkerPlaneTemplateHandles[kind] = detectorMarkerHandle
-
 	def _grid_point_to_world(self, column, row):
 		"""Convert a maze grid intersection (column, row) into world (x, y) coordinates."""
 		cellSize = self.sceneParameters.mazeCellSize
@@ -2186,15 +2092,13 @@ class COPPELIA_MazeRobot(object):
 		if orientation == 'portrait':
 			x_res = self.robotParameters.cameraResolutionY  # swap X and Y for portrait
 			y_res = self.robotParameters.cameraResolutionX
-			self.verticalViewAngle = self.robotParameters.cameraPerspectiveAngle
-			self.horizontalViewAngle = self.robotParameters.cameraPerspectiveAngle * x_res / y_res
 		elif orientation == 'landscape':
 			x_res = self.robotParameters.cameraResolutionX
 			y_res = self.robotParameters.cameraResolutionY
-			self.verticalViewAngle = self.robotParameters.cameraPerspectiveAngle * y_res / x_res
-			self.horizontalViewAngle = self.robotParameters.cameraPerspectiveAngle
 		else:
-			print('The camera orientation %s is not known. You must specify either portrait or landscape')
+			print(
+				f"Unknown camera orientation '{orientation}'. "
+				"Use 'portrait' or 'landscape'.")
 			return
 
 
@@ -2242,19 +2146,6 @@ class COPPELIA_MazeRobot(object):
 	# The functions below are used internally by the library
 	# Students typically don't need to modify these functions
 
-	# Prints the pose/position of the objects in the scene
-	def PrintObjectPositions(self):
-		print("\n\n***** OBJECT POSITIONS *****")
-		if self.robotPose is not None:
-			print("Robot 2D Pose (x,y,theta): %0.4f, %0.4f, %0.4f"%(self.robotPose[0], self.robotPose[1], self.robotPose[2]))
-
-		if self.cameraPose is not None:
-			print("Camera 3D Pose (x,y,z,roll,pitch,yaw): %0.4f, %0.4f, %0.4f, %0.4f, %0.4f, %0.4f"%(self.cameraPose[0], self.cameraPose[1], self.cameraPose[2], self.cameraPose[3], self.cameraPose[4], self.cameraPose[5]))
-
-		for index, obstacle in enumerate(self.obstaclePositions):
-			if obstacle is not None:
-				print("Obstacle %d Position (x,y,z): %0.4f, %0.4f, %0.4f"%(index, obstacle[0], obstacle[1], obstacle[2]))
-
 	# Gets the pose/position in the global coordinate frame of all the objects in the scene.
 	# Stores them in class variables. Variables will be set to none if could not be updated
 	def GetObjectPositions(self):
@@ -2297,279 +2188,30 @@ class COPPELIA_MazeRobot(object):
 			except Exception as e:
 				print(f"Error getting obstacle position {index}: {e}")
 
-	# Checks to see if an Object is within the field of view of the camera
 	def GetRBInCameraFOV(self, objectPosition):
-		# calculate range and bearing on 2D plane - relative to the camera
+		"""Return ``(visible, range, bearing)`` for a world point relative to the camera."""
 		cameraYaw = self.cameraForwardYaw if self.cameraForwardYaw is not None else self.cameraPose[5]
 		cameraPose2d = [self.cameraPose[0], self.cameraPose[1], cameraYaw]
 		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose2d, objectPosition)
-
-		# vertical_test_cam_pose = [0,self.cameraPose[2],0]
-		# vertical_test_pos = [_range,objectPosition[2]]
-		# _vert_range, _vert_bearing = self.GetRangeAndBearingFromPoseAndPoint(vertical_test_cam_pose, vertical_test_pos)
-		_valid = abs(_bearing) < self.robotParameters.cameraPerspectiveAngle/2 \
-		# 	and abs(_vert_bearing) < self.robotParameters.cameraPerspectiveAngle/4
-
-		# angle from camera's axis to the object's position
-		# verticalAngle = math.atan2(objectPosition[2]-self.cameraPose[2], _range)
-
-		#OLD code needs removing
-
-		# # check to see if in field of view
-		# if abs(_bearing) > (self.horizontalViewAngle/2.0):
-		# 	# return False to indicate object outside camera's FOV and range and bearing
-		# 	return False, _range, _bearing
-
-		# if abs(verticalAngle) > (self.verticalViewAngle/2.0):
-		# 	# return False to indicate object outside camera's FOV and range and bearing
-		# 	return False, _range, _bearing
-
-		# return True to indicate is in FOV and range and bearing
+		_valid = abs(_bearing) < self.robotParameters.cameraPerspectiveAngle / 2
 		return _valid, _range, _bearing
-
-	def ObjectInCameraFOV(self,objectPosition):
-		_,_bearing = self.GetRBInCameraFOV(objectPosition)
-		return np.abs(_bearing) <= self.robotParameters.cameraPerspectiveAngle / 2
 			
 	
 	# Determines if a 2D point is inside the arena, returns true if that is the case
 	def PointInsideArena(self, position):
-		if position[0] > -1 and position[0] < 1 and position[1] > -1 and position[1] < 1:
-			return True
-
-		return False
-
-
-	# Legacy 2025 boundary-only wall geometry. Retained internally as a possible reference for
-	# a future maze-aware replacement, but deliberately not called by GetDetectedWallPoints().
-	# Gets the range and bearing to a corner that is within the camera's field of view.
-	# Will only return a single corner, as only one corner can be in the field of view with the current setup.
-	# returns:
-	#	a list containing a [range, bearing] or an empty list if no corner is within the field of view
-	def FieldCornerRangeBearing(self, cameraPose):
-		rangeAndBearing = []
-
-		# Get range and bearing from camera's pose to each corner
-		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, [1, 1])
-		if abs(_bearing) < (self.horizontalViewAngle/2.0):
-			rangeAndBearing = [_range, _bearing]
-
-		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, [-1, 1])
-		if abs(_bearing) < (self.horizontalViewAngle/2.0):
-			rangeAndBearing = [_range, _bearing]
-
-		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, [-1, -1])
-		if abs(_bearing) < (self.horizontalViewAngle/2.0):
-			rangeAndBearing = [_range, _bearing]
-
-		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, [1, -1])
-		if abs(_bearing) < (self.horizontalViewAngle/2.0):
-			rangeAndBearing = [_range, _bearing]
-
-		return rangeAndBearing
-
-
-	# Gets the range and bearing to where the edge of camera's field of view intersects with the arena walls.
-	# returns:
-	#	None - if there are no valid wall points (i.e. the robot is right up against a wall and facing it)
-	#	A list of [range, bearing] arrays. There will either be 1 or 2 [range, bearing] arrays depending on the situation
-	#		will return 1 if the robot is close to a wall but not directly facing it and one edge of the camera's view limit is up against the wall, while the other can see part of the field
-	#		will return 2 if the robot can see the wall but is not facing a corner
-	def CameraViewLimitsRangeAndBearing(self, cameraPose):
-		viewLimitIntersectionPoints = []
-		rangeAndBearings = []
-
-		# Get valid camera view limit points along the east wall
-		p1, p2 = self.CameraViewLimitWallIntersectionPoints(cameraPose, 'east')
-		if p1 != None:
-			viewLimitIntersectionPoints.append(p1)
-		if p2 != None:
-			viewLimitIntersectionPoints.append(p2)
-
-		# Get valid camera view limit points along the north wall (wall in positive y-direction)
-		p1, p2 = self.CameraViewLimitWallIntersectionPoints(cameraPose, 'north')
-		if p1 != None:
-			viewLimitIntersectionPoints.append(p1)
-		if p2 != None:
-			viewLimitIntersectionPoints.append(p2)
-
-		# Get valid camera view limit points along the west wall
-		p1, p2 = self.CameraViewLimitWallIntersectionPoints(cameraPose, 'west')
-		if p1 != None:
-			viewLimitIntersectionPoints.append(p1)
-		if p2 != None:
-			viewLimitIntersectionPoints.append(p2)
-
-		# Get valid camera view limit points along the south wall (wall in negative y-direction)
-		p1, p2 = self.CameraViewLimitWallIntersectionPoints(cameraPose, 'south')
-		if p1 != None:
-			viewLimitIntersectionPoints.append(p1)
-		if p2 != None:
-			viewLimitIntersectionPoints.append(p2)
-
-		# Calculate range and bearing to the valid view limit wall intersection points and store in a list
-		for point in viewLimitIntersectionPoints:
-			_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, point)
-			rangeAndBearings.append([_range, _bearing])
-
-		# return None if rangeAndBearings list is empty
-		if rangeAndBearings == []:
-			return None
-		else:
-			return rangeAndBearings
-
-	
-	# Gets the points where the edges of the camera's field of view intersects with the specified wall.
-	# inputs:
-	#	cameraPose - pose of the camera [x, y, theta] in the global coordinate frame
-	# 	wall - wall want to get the camera view limit points of ('east', 'west', 'north', 'south').
-	# returns:
-	#	p1 - will be [x,y] point if it is a valid wall point (i.e. lies on the arena's walls and is within the field of view) or None if it is not valid
-	#	p2 - will be [x,y] point if it is a valid wall point (i.e. lies on the arena's walls and is within the field of view) or None if it is not valid
-	def CameraViewLimitWallIntersectionPoints(self, cameraPose, wall):
-		
-		# calculate range to wall along camera's axis using the point where the camera's axis intersects with the specified wall
-		x, y = self.CameraViewAxisWallIntersectionPoint(cameraPose, wall)
-		centreRange = math.sqrt(math.pow(cameraPose[0]-x, 2) + math.pow(cameraPose[1]-y, 2))
-
-
-		# determine camera view limit intersection points on wall
-		if wall == 'east' or wall == 'west':
-			d1 = centreRange*math.sin(self.horizontalViewAngle/2.0) / math.sin(math.pi/2.0 - self.horizontalViewAngle/2.0 - cameraPose[2])
-			d2 = centreRange*math.sin(self.horizontalViewAngle/2.0) / math.sin(math.pi/2.0 - self.horizontalViewAngle/2.0 + cameraPose[2])
-		elif wall == 'north' or wall == 'south':
-			d1 = centreRange*math.sin(self.horizontalViewAngle/2.0) / math.sin(math.pi - self.horizontalViewAngle/2.0 - cameraPose[2])
-			d2 = centreRange*math.sin(self.horizontalViewAngle/2.0) / math.sin(cameraPose[2] - self.horizontalViewAngle/2.0)
-
-
-		# add d1 and d2 (or subtract) to the camera's axis wall intersection point (add/subtract and x/y depends on wall)
-		if wall == 'east' or wall == 'west':
-			p1 = [x, y+d1]
-			p2 = [x, y-d2]
-		elif wall == 'north' or wall == 'south':
-			p1 = [x-d1, y]
-			p2 = [x+d2, y]
-
-		# determine camera view limit intersection point range and bearings relative to camera
-		range1, bearing1 = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, p1)
-		range2, bearing2 = self.GetRangeAndBearingFromPoseAndPoint(cameraPose, p2)
-
-		# Check that the two view limit intersection points are valid (i.e. occur on the arena boundary and not outside, that the bearing is within view and the range is greater than a minimum distance)
-		# Need to add small percentage to the angle due to the numerical evaluation of COPPELIA this is to ensure that after checking against all walls that 2 points are returned this is where the *1.05 comes from
-		# make sure p1 is within bounds and that bearing is valid
-		if (p1[0] < -1 or p1[0] > 1 or p1[1] < -1 or p1[1] > 1):
-			p1 = None
-		elif abs(bearing1) > (self.horizontalViewAngle/2.0)*1.05:
-			p1 = None
-		elif range1 < self.robotParameters.minWallDetectionDistance:
-			p1 = None
-		
-		# make sure p2 is within bounds
-		if (p2[0] < -1 or p2[0] > 1 or p2[1] < -1 or p2[1] > 1):
-			p2 = None
-		elif abs(bearing2) > (self.horizontalViewAngle/2.0)*1.05:
-			p2 = None
-		elif range2 < self.robotParameters.minWallDetectionDistance:
-			p2 = None
-
-		return p1, p2
-
-
-	# Gets the point where the camera's view axis (centre of image) intersects with the specified wall.
-	# inputs:
-	#	cameraPose - pose of the camera [x, y, theta] in the global coordinate frame
-	# 	wall - wall want to get the camera view limit points of ('east', 'west', 'north', 'south').
-	# returns:
-	#	x - the x coordinate where the camera's axis intersects with the specified wall
-	#	y - the y coordinate where the camera's axis intersects with the specified wall
-	def CameraViewAxisWallIntersectionPoint(self, cameraPose, wall):
-		if wall == 'east':
-			x = 1
-			y = (x - cameraPose[0]) * math.tan(cameraPose[2]) + cameraPose[1]
-		
-		elif wall == 'north':
-			y = 1
-			x = (y - cameraPose[1]) / math.tan(cameraPose[2]) + cameraPose[0]
-
-		elif wall == 'west':
-			x = -1
-			y = (x - cameraPose[0]) * math.tan(cameraPose[2]) + cameraPose[1]
-
-		elif wall == 'south':
-			y = -1
-			x = (y - cameraPose[1]) / math.tan(cameraPose[2]) + cameraPose[0]
-
-		return x, y
-	
+		return -1 < position[0] < 1 and -1 < position[1] < 1
 
 	# Wraps input value to be between -pi and pi
 	def WrapToPi(self, radians):
-		return ((radians + math.pi) % (2* math.pi) - math.pi)
+		return (radians + math.pi) % (2 * math.pi) - math.pi
 
 	# Gets the range and bearing given a 2D pose (x,y,theta) and a point(x,y). 
 	# The bearing will be relative to the pose's angle
 	def GetRangeAndBearingFromPoseAndPoint(self, pose, point):
-		_range = math.sqrt(math.pow(pose[0] - point[0], 2) + math.pow(pose[1] - point[1], 2))
+		_range = math.hypot(pose[0] - point[0], pose[1] - point[1])
 		_bearing = self.WrapToPi(math.atan2((point[1]-pose[1]), (point[0]-pose[0])) - pose[2])
 
 		return _range, _bearing
-
-def print_debug_range_bearing(object_type, range_bearing_data):
-	"""
-	Helper function to print range and bearing information for detected objects.
-	Useful for debugging object detection.
-	
-	Args:
-		object_type (str): Name of the object type being displayed
-		range_bearing_data: Range and bearing data from GetDetectedObjects()
-	"""
-	if range_bearing_data is None:
-		print(f"{object_type}: No objects detected")
-		return
-	
-	# Handle items array (6-element list, one per item type)
-	if object_type == "Items" and isinstance(range_bearing_data, list) and len(range_bearing_data) == 6:
-		item_names = ["Bowls", "Mugs", "Bottles", "Soccer Balls", "Rubiks Cubes", "Cereal Boxes"]
-		any_items_found = False
-		
-		for item_type, detections in enumerate(range_bearing_data):
-			if detections is not None and len(detections) > 0:
-				any_items_found = True
-				for i, rb in enumerate(detections):
-					if rb is not None and len(rb) >= 2:
-						range_m = rb[0]
-						bearing_rad = rb[1]
-						bearing_deg = math.degrees(bearing_rad)
-						print(f"{item_names[item_type]}[{i}]: Range = {range_m:.3f}m, Bearing = {bearing_rad:.3f}rad ({bearing_deg:.1f}°)")
-		
-		if not any_items_found:
-			print(f"{object_type}: No items detected")
-		return
-	
-	# Handle single detection or list of detections
-	if isinstance(range_bearing_data, list):
-		if len(range_bearing_data) == 0:
-			print(f"{object_type}: No detections")
-			return
-		
-		# Check if this is a single [range, bearing] pair
-		if len(range_bearing_data) == 2 and isinstance(range_bearing_data[0], (int, float)):
-			range_m = range_bearing_data[0]
-			bearing_rad = range_bearing_data[1]
-			bearing_deg = math.degrees(bearing_rad)
-			print(f"{object_type}: Range = {range_m:.3f}m, Bearing = {bearing_rad:.3f}rad ({bearing_deg:.1f}°)")
-		else:
-			# List of multiple detections
-			for i, rb in enumerate(range_bearing_data):
-				if rb is not None and isinstance(rb, list) and len(rb) >= 2:
-					range_m = rb[0]
-					bearing_rad = rb[1]
-					bearing_deg = math.degrees(bearing_rad)
-					print(f"{object_type}[{i}]: Range = {range_m:.3f}m, Bearing = {bearing_rad:.3f}rad ({bearing_deg:.1f}°)")
-				elif rb is None:
-					print(f"{object_type}[{i}]: Not detected")
-	else:
-		print(f"{object_type}: Invalid data format")
 
 # Parameter classes for robot and scene configuration
 class RobotParameters(object):
@@ -2577,7 +2219,6 @@ class RobotParameters(object):
 	def __init__(self):
 		# Drive Parameters
 		self.driveType = 'differential'  # currently only 'differential' implemented
-		self.minimumLinearSpeed = 0.0   # minimum speed in m/s
 		self.maximumLinearSpeed = 0.25  # maximum speed in m/s
 		self.driveSystemQuality = 1.0   # quality from 0 to 1 (1 = perfect)
 		
@@ -2598,15 +2239,10 @@ class RobotParameters(object):
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m
 		self.maxMarkerDetectionDistance = 1.5    # max distance to detect wall markers in m
 		self.maxVictimDetectionDistance = 1.5    # max distance to detect victim objects in m
-		self.minWallDetectionDistance = 0.02      # min distance for a wall point to be considered valid, in m
 		
 		# Victim collection parameter from the 2026 assessment rules
 		self.victimCollectionDistance = 0.10  # shortest horizontal clearance in metres
 		
-		# Simulation Parameters
-		self.sync = False  # synchronous mode (deprecated with ZMQ Remote API)
-
-
 class SceneParameters(object):
 	"""Parameters for configuring the EGB320 search-and-rescue maze scene (2026)."""
 	def __init__(self):
@@ -2678,5 +2314,9 @@ class SceneParameters(object):
 
 		if tuple(self.baseCell) in seenCells:
 			raise ValueError(f"baseCell {self.baseCell} must not coincide with a victim cell")
+
+
+# Earlier class name retained so existing staff solutions continue to run.
+COPPELIA_MazeRobot = MazeBot
 
 

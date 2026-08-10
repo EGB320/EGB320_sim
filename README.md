@@ -1,265 +1,211 @@
-# EGB320 MazeBot Library
+# EGB320 MazeBot simulator
 
-Python support for the 2026 EGB320 search-and-rescue maze simulation in CoppeliaSim. The
-library generates the maze, controls the robot, reads its camera and distance sensors, and
-provides software-triggered victim collection and release.
+This repository contains the 2026 EGB320 search-and-rescue maze simulation. The Python
+library can drive the robot, read its sensors, detect markers and victims, and collect or
+release victims.
 
-## Installation
+## Start here
 
-Install CoppeliaSim and the required Python packages:
+1. Install [CoppeliaSim Edu](https://www.coppeliarobotics.com/) and Python 3.
+2. Install the CoppeliaSim Python client:
 
-```bash
-pip install coppeliasim-zmqremoteapi-client opencv-python numpy
-```
+   ```bash
+   pip install coppeliasim-zmqremoteapi-client
+   ```
 
-Load `EGB320_search_and_rescue_2026.ttt` in CoppeliaSim, then run either example:
+3. Open `EGB320_search_and_rescue_2026.ttt` in CoppeliaSim.
+4. Run one of the examples:
 
-```bash
-python EGB320_CoppeliaSim_Example.py
-python EGB320_CoppeliaSim_Example_keyboard.py
-```
+   ```bash
+   python EGB320_CoppeliaSim_Example.py
+   python EGB320_CoppeliaSim_Example_keyboard.py
+   ```
 
-## Quick start
+The keyboard example requires Windows. Its controls are W/A/S/D, Space to collect or
+release a victim, and Q to quit.
+
+## Smallest useful program
 
 ```python
-from mazebot_lib import COPPELIA_MazeRobot, RobotParameters, SceneParameters
+import time
 
-robot_parameters = RobotParameters()
-scene_parameters = SceneParameters()
+from mazebot_lib import MazeBot
 
-robot = COPPELIA_MazeRobot(robot_parameters, scene_parameters)
+robot = MazeBot()
 robot.StartSimulator()
 
 try:
+    robot.SetTargetVelocities(0.08, 0.0)
+
     while True:
         robot.UpdateObjectPositions()
-        distances = robot.GetWallDistances()
 
-        if distances['front'] is not None and distances['front'] < 0.10:
-            robot.SetTargetVelocities(0.0, 0.3)
-        else:
-            robot.SetTargetVelocities(0.08, 0.0)
-except KeyboardInterrupt:
+        distances = robot.GetWallDistances()
+        detections = robot.GetDetections()
+        time.sleep(0.1)
+finally:
+    robot.SetTargetVelocities(0.0, 0.0)
     robot.StopSimulator()
 ```
 
-## Main classes
+Use `try/finally` so the simulator is stopped even if your program encounters an error.
 
-### `COPPELIA_MazeRobot`
+## Main robot commands
 
-```python
-COPPELIA_MazeRobot(
-    robotParameters,
-    sceneParameters,
-    coppelia_server_ip='127.0.0.1',
-    port=23000,
-)
-```
-
-The main CoppeliaSim interface.
-
-### `RobotParameters`
-
-Configures drive, camera, obstacle-detection and victim-collection behaviour. Important
-settings include:
+### Movement
 
 ```python
-parameters.maximumLinearSpeed = 0.25
-parameters.driveSystemQuality = 1.0
-parameters.cameraResolutionX = 640
-parameters.cameraResolutionY = 480
-parameters.victimCollectionDistance = 0.10
-parameters.sync = False
+robot.SetTargetVelocities(forward_velocity, turn_velocity)
 ```
 
-### `SceneParameters`
+- Forward velocity is in metres per second.
+- Turn velocity is in radians per second.
+- Positive turn velocity turns left.
+- Send `(0.0, 0.0)` to stop.
 
-Configures maze generation and starting positions. The defaults generate the approved
-7-by-7 example maze with three victims.
+Examples:
 
 ```python
-scene.mazeRows = 7
-scene.mazeColumns = 7
-scene.mazeCellSize = 0.280
-scene.baseCell = (0, 6)
-scene.victimCells = {
-    'L1': (1, 5),
-    'L2': (4, 3),
-    'L3': (6, 0),
-}
+robot.SetTargetVelocities(0.10, 0.0)   # drive forward
+robot.SetTargetVelocities(0.0, 0.30)   # turn left
+robot.SetTargetVelocities(0.0, 0.0)    # stop
 ```
 
-## Robot control
-
-### `StartSimulator()`
-
-Stops a running simulation if necessary, regenerates the maze while stopped, places the
-robot and starts the simulation.
-
-### `StopSimulator()`
-
-Stops the CoppeliaSim simulation.
-
-### `SetTargetVelocities(x_dot, theta_dot)`
-
-Commands forward velocity in metres per second and angular velocity in radians per second.
+### Robot pose
 
 ```python
-robot.SetTargetVelocities(0.10, 0.0)
-robot.SetTargetVelocities(0.0, 0.3)
-robot.SetTargetVelocities(0.0, 0.0)
+pose, obstacle_positions = robot.UpdateObjectPositions()
 ```
 
-## Sensors
+`pose` is `[x, y, heading]`, with position in metres and heading in radians. Call this
+before requesting range and bearing detections.
 
-### `GetWallDistances()`
-
-Returns robot-relative proximity readings in metres:
+### Wall-distance sensors
 
 ```python
 distances = robot.GetWallDistances()
+
 left = distances['left']
 front = distances['front']
 right = distances['right']
 ```
 
-A value is `None` when the corresponding sensor has no detection. Despite the method name,
-the proximity sensors can detect any detectable object in their sensing volumes.
+Each value is a distance in metres or `None` when the sensor detects nothing. The names
+are relative to the robot, not the maze.
 
-### `GetCameraImage()`
+### Markers and yellow victims
 
-Returns `(resolution, image_data)`. Resolution is `[width, height]`; image data is `None`
-when no image is available.
+```python
+detections = robot.GetDetections()
+```
+
+The result contains five separate object types:
+
+```python
+{
+    'base': [],
+    'victim': [],          # cyan victim marker on a wall
+    'rubble_victim': [],
+    'hazard': [],
+    'victim_object': [],   # yellow victim on the ground
+}
+```
+
+Each non-empty list contains one `[range, bearing]` pair. Range is in metres and bearing
+is in radians, relative to the camera centreline.
+
+```python
+yellow_victims = detections['victim_object']
+if yellow_victims:
+    range_m, bearing_rad = yellow_victims[0]
+    print(range_m, bearing_rad)
+```
+
+`GetDetectedVictims()` is also available when only the yellow victim is needed.
+
+### Camera image
 
 ```python
 resolution, image_data = robot.GetCameraImage()
 ```
 
-### `GetDetectedObjects(objects=None)`
-
-Returns requested obstacle or marker detections as `[range, bearing]` pairs. An empty list
-means no requested object was detected. With no argument it continues to select all optional
-obstacles for backwards compatibility.
-
-```python
-from mazebot_lib import mazeObjects
-
-obstacles = robot.GetDetectedObjects([mazeObjects.obstacles])
-for range_m, bearing_rad in obstacles:
-    print(range_m, bearing_rad)
-
-victim_markers = robot.GetDetectedObjects([mazeObjects.victimMarker])
-```
-
-Available selectors are `mazeObjects.obstacle0`, `mazeObjects.obstacle1`,
-`mazeObjects.obstacle2`, `mazeObjects.baseStationMarker`, `mazeObjects.victimMarker`,
-`mazeObjects.rubbleVictimMarker`, `mazeObjects.hazardMarker`, and `mazeObjects.victim`
-(`mazeObjects.victimObject` is an equivalent descriptive alias).
-The group selectors are `mazeObjects.obstacles`, `mazeObjects.markers`, and
-`mazeObjects.victims`.
-
-### `GetDetectedMarkers()`
-
-Runs the low-resolution object detector once and retains the object type labels. It returns
-zero-or-one `[range, bearing]` pair under each of the keys `base`, `victim`,
-`rubble_victim`, `hazard`, and `victim_object`; a type that is not visible has an empty list.
-The `victim` key represents the cyan wall marker, while `victim_object` represents the
-separate yellow victim on the ground. When several objects share a class colour, the closest
-matching object in the camera field of view is used.
-
-```python
-markers = robot.GetDetectedMarkers()
-for marker_type, detections in markers.items():
-    for range_m, bearing_rad in detections:
-        print(marker_type, range_m, bearing_rad)
-```
-
-Each marker wall has two child planes. The textured `marker` remains white and is what students
-see through `VisionSensor`. A second untextured `detector_marker` normally has no visible layer.
-One simulator-side call briefly swaps the two planes, renders and processes `ObjectDetector`, and
-restores them without changing CoppeliaSim's global visible-layer selection. Its class colours are blue for the base
-station, cyan for an exposed victim, magenta for a rubble victim, and red for a hazard. The
-structural wall and student-facing marker appearance therefore remain unchanged.
-
-### `GetDetectedVictims()`
-
-Runs the same low-resolution detector and returns zero-or-one `[range, bearing]` pair for
-the closest visible victim. Each yellow visual victim owns a simple, untextured yellow
-`victim_detector_proxy`. The proxy normally has no visible layer and follows the victim when
-it is collected or released. During an object-detector render the Lua helper atomically hides
-the detailed visual model and exposes only the proxy, so `VisionSensor` and the editor retain
-the original victim appearance without adding a second complex mesh.
-
-```python
-victims = robot.GetDetectedVictims()
-if victims:
-    range_m, bearing_rad = victims[0]
-```
-
-### `UpdateObjectPositions()`
-
-Refreshes cached robot, camera and optional obstacle positions. It returns
-`(robotPose, obstaclePositions)`.
-
-```python
-robot_pose, obstacle_positions = robot.UpdateObjectPositions()
-```
-
-`robotPose` is `[x, y, theta]` in metres and radians.
-
-### `SetCameraResolution(x_res, y_res)`
-
-Sets the onboard camera resolution and returns `True` when successful.
+`resolution` is `[width, height]`. Reading the full camera image is more expensive than
+the small object detector, so avoid calling it when it is not needed.
 
 ## Victim collection
 
-### `CollectVictim()`
-
-Attempts to collect the nearest generated victim. Collection succeeds only when the
-shortest horizontal clearance between the robot model and victim is no greater than
-`victimCollectionDistance`, which defaults to 0.10 m.
+Attempt collection only after navigating close to a victim:
 
 ```python
-success, victim_label, distance = robot.CollectVictim()
+success, label, distance = robot.CollectVictim()
 ```
 
-On success, the victim is attached to `/Robot/VictimCarryPoint`. The library uses the
-dummy's scene-authored position and orientation without moving the dummy.
-
-### `HasVictim()`
-
-Returns `True` while a victim is attached to the robot.
-
-### `ReleaseVictim()`
-
-Places the carried victim on the maze floor 0.15 m in front of the robot and returns
-`(success, victim_label)`.
+Collection succeeds when the victim is within the permitted collection distance. The
+default is 0.10 m.
 
 ```python
 if robot.HasVictim():
-    success, victim_label = robot.ReleaseVictim()
+    success, label = robot.ReleaseVictim()
 ```
 
-## Keyboard example
+Released victims are placed on the floor in front of the robot.
 
-The keyboard example uses held-key input on Windows:
+## Changing parameters
 
-- W/S: drive forward or backward
-- A/D: rotate left or right
-- Space: collect a nearby victim or release the carried victim
-- Q: stop and exit
+The default parameters are suitable for the supplied scene. Change only the settings your
+experiment needs:
 
-Movement commands are sent only when the held-key state changes. Releasing the movement
-keys sends one zero-velocity command.
+```python
+from mazebot_lib import MazeBot, RobotParameters, SceneParameters
+
+robot_parameters = RobotParameters()
+robot_parameters.maximumLinearSpeed = 0.20
+robot_parameters.cameraTilt = -0.10
+
+scene_parameters = SceneParameters()
+scene_parameters.robotStartingPosition = [0.0, 0.0, 0.0]
+
+robot = MazeBot(robot_parameters, scene_parameters)
+```
+
+The default maze is 7 by 7 cells and contains three victim objects. Maze walls and victims
+are regenerated whenever `StartSimulator()` is called.
+
+## Optional object selection
+
+Most student code should use `GetDetections()`. `GetDetectedObjects()` is available
+when selecting optional obstacles or one particular detection class:
+
+```python
+from mazebot_lib import MazeObject
+
+obstacles = robot.GetDetectedObjects([MazeObject.obstacles])
+victim_markers = robot.GetDetectedObjects([MazeObject.victimMarker])
+yellow_victims = robot.GetDetectedObjects([MazeObject.victims])
+```
+
+## Files students need
+
+- `EGB320_search_and_rescue_2026.ttt`: CoppeliaSim scene.
+- `mazebot_lib.py`: Python robot library.
+- `EGB320_CoppeliaSim_Example.py`: minimal starting example.
+- `EGB320_CoppeliaSim_Example_keyboard.py`: manual driving and sensor demonstration.
+- `keyboard_control.py`: keyboard helper used by the manual-driving example.
+
+The Lua files are source copies of scripts already embedded in the `.ttt` scene. Students
+do not need to paste them into CoppeliaSim.
 
 ## Troubleshooting
 
-If the Python client cannot connect, confirm that CoppeliaSim is open, the search-and-rescue
-scene is loaded, and the ZeroMQ Remote API is listening on port 23000.
+If Python cannot connect:
 
-If an optional sensor is missing, the library reports it during initialization and keeps the
-remaining functionality available. Required robot, motor, floor and maze-template objects
-must use the paths expected by `mazebot_lib.py`.
+- Confirm CoppeliaSim is open.
+- Confirm `EGB320_search_and_rescue_2026.ttt` is loaded.
+- Confirm the ZeroMQ Remote API is listening on port 23000.
+- Stop any other Python script that may already be controlling the simulator.
+
+If detection returns empty lists, call `UpdateObjectPositions()` first and check that the
+object is visible to the robot camera.
 
 ## License
 

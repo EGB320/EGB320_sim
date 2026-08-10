@@ -1,6 +1,6 @@
 -- EGB320 Search and Rescue MazeBot control script for CoppeliaSim (2026)
 -- Maze generation and robot control are performed from mazebot_lib.py through the
--- ZeroMQ remote API. This simulation script intentionally has no pick-and-place helpers.
+-- ZeroMQ remote API.
 
 sim = require('sim')
 simVision = require('simVision')
