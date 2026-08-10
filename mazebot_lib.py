@@ -25,7 +25,9 @@ Robot Control:
 - UpdateObjectPositions()               : Update object positions (call this every loop!)
 
 Object Detection:
-- GetDetectedObjects(objects)           : Get range/bearing to optional obstacle objects
+- GetDetectedObjects(objects)           : Get range/bearing to obstacles, victims or wall markers
+- GetDetectedMarkers()                  : Get wall-marker and yellow-victim detections by type
+- GetDetectedVictims()                  : Get range/bearing to a visible victim
 - GetCameraImage()                      : Get camera image for computer vision
 - GetWallDistances()                    : Get robot-relative left/front/right proximity readings
 
@@ -125,6 +127,23 @@ VICTIM_SURFACE_CLEARANCE = 0.001
 VICTIM_CARRY_ORIENTATION = (0.0, math.pi / 2.0, 0.0)
 VICTIM_RELEASE_FORWARD_OFFSET = 0.15
 
+# Emissive colours used by both the marker materials and robot_object_detector_script.lua.
+# They deliberately avoid the green shades used by the three optional obstacle objects.
+MARKER_EMISSIVE_COLOURS = {
+	'base': (0.0, 0.0, 1.0),
+	'victim': (0.0, 1.0, 1.0),
+	'rubble_victim': (1.0, 0.0, 1.0),
+	'hazard': (1.0, 0.0, 0.0),
+}
+VICTIM_DETECTOR_COLOUR = (1.0, 1.0, 0.0)
+VISUAL_MARKER_COLOUR = (1.0, 1.0, 1.0)
+# Detector colour planes and the ObjectDetector sensor are not shown in the editor.
+# The robot's Lua script temporarily puts the detector planes on layer 1 only for
+# the duration of an explicit detector render, without changing the global layer mask.
+VISUAL_MARKER_VISIBILITY_LAYER = 1
+DETECTOR_MARKER_HIDDEN_LAYER = 0
+DETECTOR_MARKER_FACE_OFFSET = 0.0002
+
 
 
 # Object types retained for the search-and-rescue challenge.
@@ -134,8 +153,18 @@ class mazeObjects(IntEnum):
 	obstacle1 = 1
 	obstacle2 = 2
 
-	# Obstacle group for detection
+	# Search-and-rescue wall marker types. Values 0-6 match detector packet indices.
+	baseStationMarker = 3
+	victimMarker = 4
+	rubbleVictimMarker = 5
+	hazardMarker = 6
+	victim = 7
+	victimObject = 7
+
+	# Detection groups
 	obstacles = 100
+	markers = 101
+	victims = 102
 
 
 ################################
@@ -209,11 +238,16 @@ class COPPELIA_MazeRobot(object):
 		self.hazardWallTemplateHandle = None
 		self.wallPostTemplateHandle = None
 		self.victimTemplateHandle = None
+		self.markerPlaneTemplateHandles = {}
+		self.detectorMarkerPlaneTemplateHandles = {}
 
 		# Generated maze object bookkeeping (used for cleanup on regeneration)
 		self.generatedSceneRootHandle = None
 		self.generatedMazeWallHandles = []
 		self.generatedMarkerWallHandles = []
+		self.generatedVisualMarkerHandles = []
+		self.generatedDetectorMarkerHandles = []
+		self.generatedVictimDetectorHandles = []
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
@@ -247,6 +281,7 @@ class COPPELIA_MazeRobot(object):
 		# Object position variables
 		self.robotPose = None
 		self.cameraPose = None
+		self.cameraForwardYaw = None
 		self.obstaclePositions = [None, None, None]
 
 		# Connect to CoppeliaSim
@@ -338,18 +373,85 @@ class COPPELIA_MazeRobot(object):
 				if _valid and _range < max_detection_distance:
 					return [_range, _bearing]
 		return None
-	
+
+	def _read_object_detector_packet(self):
+		"""Return the flat numeric packet produced by the ObjectDetector vision script."""
+		if self.objectDetectorHandle is None or self.scriptHandle is None:
+			return []
+		try:
+			# Perform the visibility swap and sensor render atomically inside CoppeliaSim.
+			# This avoids changing the editor's global visible-layer mask, which otherwise
+			# makes layer 9 and the ObjectDetector view flicker on each API call.
+			result, _data, packets = self.sim.callScriptFunction(
+				'handleObjectDetector', self.scriptHandle)
+			if result == -1 or not packets:
+				return []
+			return list(packets)
+		except Exception as e:
+			print(f'Warning: ObjectDetector render failed: {e}')
+			return []
+
+	def _process_marker_detection(self, markerPosition, detectionIndex, objectsDetected):
+		"""Convert one colour flag and known static marker position to range/bearing."""
+		if markerPosition is None or not self._is_object_detected(objectsDetected, detectionIndex):
+			return None
+		_valid, _range, _bearing = self.GetRBInCameraFOV(markerPosition)
+		if _valid and _range < self.robotParameters.maxMarkerDetectionDistance:
+			return [_range, _bearing]
+		return None
+
+	@staticmethod
+	def _marker_selector_map():
+		"""Map public marker selectors to internal maze-generation marker kinds."""
+		return {
+			mazeObjects.baseStationMarker: 'base',
+			mazeObjects.victimMarker: 'victim',
+			mazeObjects.rubbleVictimMarker: 'rubble_victim',
+			mazeObjects.hazardMarker: 'hazard',
+		}
+
+	def _get_marker_detections_from_packet(self, objectsDetected, requestedMarkerTypes=None):
+		"""Return marker detections grouped by marker kind, using one detector packet."""
+		markerSelectorMap = self._marker_selector_map()
+		requestedMarkerTypes = set(markerSelectorMap) if requestedMarkerTypes is None else set(requestedMarkerTypes)
+		markerDetections = {kind: [] for kind in markerSelectorMap.values()}
+
+		# New packet: [obstacle0, obstacle1, obstacle2, base marker, victim marker,
+		# rubble-victim marker, hazard marker, victim object]. Legacy 23-value
+		# warehouse packets have no marker flags.
+		if len(objectsDetected) < 7 or len(objectsDetected) >= 9:
+			return markerDetections
+
+		for markerSelector, kind in markerSelectorMap.items():
+			if markerSelector not in requestedMarkerTypes:
+				continue
+			candidates = []
+			for marker in self.markerWallPlacements:
+				if marker['kind'] != kind:
+					continue
+				result = self._process_marker_detection(
+					marker.get('position'), int(markerSelector), objectsDetected)
+				if result is not None:
+					candidates.append(result)
+			# A colour flag identifies the visible type, not a specific wall when several
+			# walls share that colour. The nearest in-FOV wall is the only defensible
+			# association; farther candidates are normally occluded by it in the maze.
+			if candidates:
+				markerDetections[kind].append(min(candidates, key=lambda detection: detection[0]))
+
+		return markerDetections
+
 	def GetDetectedObjects(self, objects=None):
 		"""
-		Gets the range and bearing to requested obstacles in the camera's field of view.
+		Gets the range and bearing to requested obstacles, victims or wall markers in the camera FOV.
 		
 		Args:
-			objects: List containing mazeObjects.obstacles and/or individual obstacle
-				types. Defaults to all obstacles.
+			objects: List containing obstacle/victim/marker selectors or group selectors.
+				Defaults to all obstacles for backwards compatibility.
 			
 		Returns:
-			list: Detected obstacles as [range, bearing] pairs. Returns an empty list when
-				no requested obstacle is detected.
+			list: Requested detections as [range, bearing] pairs. Use GetDetectedMarkers()
+				when marker type labels need to be retained in a mixed query.
 		"""
 		# Default to detecting all obstacles if none are specified.
 		if objects is None:
@@ -362,24 +464,26 @@ class COPPELIA_MazeRobot(object):
 			mazeObjects.obstacle2,
 		)
 		detectAllObstacles = mazeObjects.obstacles in requestedObjects
-		if not detectAllObstacles and not any(obstacle in requestedObjects for obstacle in obstacleTypes):
+		markerSelectorMap = self._marker_selector_map()
+		detectAllMarkers = mazeObjects.markers in requestedObjects
+		detectVictims = (
+			mazeObjects.victim in requestedObjects or
+			mazeObjects.victims in requestedObjects)
+		requestedMarkerTypes = {
+			selector for selector in markerSelectorMap
+			if detectAllMarkers or selector in requestedObjects
+		}
+		if (not detectAllObstacles and
+				not any(obstacle in requestedObjects for obstacle in obstacleTypes) and
+				not requestedMarkerTypes and
+				not detectVictims):
 			return []
 
 		# Check if camera and detector data are available.
 		if self.cameraPose is None or self.objectDetectorHandle is None:
 			return []
 
-		# Get object detection data from CoppeliaSim vision sensor
-		try:
-			result, data, packets = self.sim.handleVisionSensor(self.objectDetectorHandle)
-			
-			if result == -1 or not packets or len(packets) == 0:
-				objectsDetected = []
-			else:
-				objectsDetected = packets
-				
-		except Exception:
-			objectsDetected = []
+		objectsDetected = self._read_object_detector_packet()
 
 		obstaclesRangeBearing = []
 		if objectsDetected:
@@ -398,7 +502,80 @@ class COPPELIA_MazeRobot(object):
 					if result is not None:
 						obstaclesRangeBearing.append(result)
 
+		markerDetections = self._get_marker_detections_from_packet(
+			objectsDetected, requestedMarkerTypes)
+		for kind in markerSelectorMap.values():
+			obstaclesRangeBearing.extend(markerDetections[kind])
+
+		if detectVictims:
+			obstaclesRangeBearing.extend(
+				self._get_victim_detections_from_packet(objectsDetected))
+
 		return obstaclesRangeBearing
+
+	def _get_victim_detections_from_packet(self, objectsDetected):
+		"""Return the closest visible, uncollected victim reported by the detector."""
+		victimDetectionIndex = int(mazeObjects.victim)
+		if not self._is_object_detected(objectsDetected, victimDetectionIndex):
+			return []
+
+		candidates = []
+		for label, victimHandle in self.victimHandles.items():
+			if victimHandle == self.carriedVictimHandle:
+				continue
+			try:
+				position = self.sim.getObjectPosition(victimHandle, -1)
+			except Exception:
+				position = self.victimPositions.get(label)
+			if position is None:
+				continue
+			valid, rangeMetres, bearingRadians = self.GetRBInCameraFOV(position)
+			if valid and rangeMetres < self.robotParameters.maxVictimDetectionDistance:
+				candidates.append([rangeMetres, bearingRadians])
+
+		# The colour packet identifies the class rather than individual instances. Return
+		# only the closest geometrically valid victim to avoid reporting occluded victims.
+		return [min(candidates, key=lambda detection: detection[0])] if candidates else []
+
+	def GetDetectedVictims(self):
+		"""
+		Detect the closest visible victim object.
+
+		Returns:
+			list: Zero-or-one ``[range, bearing]`` pair. An empty list means that no
+				uncollected victim was detected.
+		"""
+		if self.cameraPose is None or self.objectDetectorHandle is None:
+			return []
+		return self._get_victim_detections_from_packet(
+			self._read_object_detector_packet())
+
+	def GetDetectedMarkers(self):
+		"""
+		Detect the four wall-marker types and yellow victim objects with one sensor update.
+
+		Returns:
+			dict: Zero-or-one [range, bearing] pair under each of ``base``,
+				``victim``, ``rubble_victim``, ``hazard`` and ``victim_object``.
+				The ``victim`` key is the cyan victim marker on a wall, whereas
+				``victim_object`` is the separate yellow victim lying on the ground.
+				A list is empty when that type is not visible.
+		"""
+		emptyResult = {
+			'base': [],
+			'victim': [],
+			'rubble_victim': [],
+			'hazard': [],
+			'victim_object': [],
+		}
+		if self.cameraPose is None or self.objectDetectorHandle is None:
+			return emptyResult
+
+		objectsDetected = self._read_object_detector_packet()
+		detections = self._get_marker_detections_from_packet(objectsDetected)
+		detections['victim_object'] = self._get_victim_detections_from_packet(
+			objectsDetected)
+		return detections
 
 
 	def GetCameraImage(self):
@@ -830,6 +1007,9 @@ class COPPELIA_MazeRobot(object):
 		if any(handle is None for handle in wallTemplateHandles) or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
 			sys.exit(-1)
 
+		# Colour only each child marker plane. The white structural wall remains unchanged.
+		self._configure_marker_template_planes()
+
 		# --- Search-and-rescue collection point and optional robot sensors ---
 		self.GetVictimCarryPointHandle()
 		self.GetCameraHandle()
@@ -856,9 +1036,16 @@ class COPPELIA_MazeRobot(object):
 
 	# Get Script Handle (attached to Robot object)
 	def GetScriptHandle(self):
-		# The robot handle doubles as the script handle for callScriptFunction calls
-		self.scriptHandle = self.robotHandle
-		return 0 if self.scriptHandle is not None else -1
+		"""Resolve the simulation script attached to the Robot model."""
+		if self.robotHandle is None:
+			self.scriptHandle = None
+			return -1
+		try:
+			self.scriptHandle = self.sim.getScriptAssociatedWithObject(self.robotHandle)
+		except Exception:
+			# Newer scenes can expose scripts as scene objects beneath their model.
+			self.scriptHandle = self._try_get_object('/Robot/Script')
+		return 0 if self.scriptHandle is not None and self.scriptHandle != -1 else -1
 
 	# Get ZMQ Camera Handle (the robot's onboard vision sensor - NOT the external /camera overview camera)
 	def GetCameraHandle(self):
@@ -960,6 +1147,20 @@ class COPPELIA_MazeRobot(object):
 			return
 		self.SetCameraPose(self.robotParameters.cameraDistanceFromRobotCenter, self.robotParameters.cameraHeightFromFloor, self.robotParameters.cameraTilt)
 		self.SetCameraOrientation(self.robotParameters.cameraOrientation)
+		if self.objectDetectorHandle is not None:
+			try:
+				# The detector must render visible RGB colours, not CoppeliaSim's object-ID
+				# colour mode. Reuse the main camera's known-good renderer setting.
+				renderMode = self.sim.getObjectInt32Param(
+					self.cameraHandle, self.sim.visionintparam_render_mode)
+				self.sim.setObjectInt32Param(
+					self.objectDetectorHandle, self.sim.visionintparam_render_mode, renderMode)
+				self.sim.setObjectInt32Param(
+					self.objectDetectorHandle,
+					self.sim.objintparam_visibility_layer,
+					DETECTOR_MARKER_HIDDEN_LAYER)
+			except Exception as e:
+				print(f"Warning: could not configure ObjectDetector render mode: {e}")
 
 	def SetScene(self):
 		"""
@@ -1207,6 +1408,107 @@ class COPPELIA_MazeRobot(object):
 				f"length axis: local {axisNames[geometry['lengthAxisIndex']]}")
 		print(f"wall_post template size (x,y,z): {self.wallPostTemplateSize}")
 		print(f"victim template size (x,y,z): {self.victimTemplateSize}")
+
+	def _find_marker_child(self, wallModelHandle, childAlias, required=True):
+		"""Return a specifically named child shape beneath a marker-wall model base."""
+		shapeHandles = self.sim.getObjectsInTree(wallModelHandle, self.sim.sceneobject_shape, 0)
+		childShapes = [handle for handle in shapeHandles if handle != wallModelHandle]
+		matches = []
+		for handle in childShapes:
+			alias = self.sim.getObjectAlias(handle, 1).replace('\\', '/')
+			if alias.rsplit('/', 1)[-1].lower() == childAlias.lower():
+				matches.append(handle)
+
+		if len(matches) == 1:
+			return matches[0]
+		if childAlias == 'marker' and not matches and len(childShapes) == 1:
+			return childShapes[0]
+		if not required and not matches:
+			return None
+		raise ValueError(
+			f"Marker-wall model handle {wallModelHandle} must contain exactly one "
+			f"child shape named '{childAlias}'.")
+
+	def _find_marker_plane(self, wallModelHandle):
+		"""Return the textured visual marker child."""
+		return self._find_marker_child(wallModelHandle, 'marker')
+
+	def _find_detector_marker_plane(self, wallModelHandle, required=True):
+		"""Return the untextured detector-only marker child."""
+		return self._find_marker_child(wallModelHandle, 'detector_marker', required=required)
+
+	def _ensure_detector_marker_plane(self, wallModelHandle, visualMarkerHandle):
+		"""Create/reuse an untextured plane matching the visual marker geometry and pose."""
+		detectorMarkerHandle = self._find_detector_marker_plane(wallModelHandle, required=False)
+		if detectorMarkerHandle is None:
+			# bit4 strips all textures while retaining the exact source-plane geometry.
+			detectorMarkerHandle = self.sim.copyPasteObjects([visualMarkerHandle], 16)[0]
+			self.sim.setObjectParent(detectorMarkerHandle, wallModelHandle, True)
+			self.sim.setObjectAlias(detectorMarkerHandle, 'detector_marker')
+
+		# Place the colour plane slightly closer to the cell/camera. It covers the
+		# textured marker only during the atomic ObjectDetector render.
+		self.sim.setObjectPosition(
+			detectorMarkerHandle,
+			visualMarkerHandle,
+			[0.0, 0.0, DETECTOR_MARKER_FACE_OFFSET])
+		self.sim.setObjectOrientation(detectorMarkerHandle, visualMarkerHandle, [0.0, 0.0, 0.0])
+		self.sim.setShapeTexture(
+			detectorMarkerHandle, -1, self.sim.texturemap_plane, 0, [1.0, 1.0])
+		self.sim.setObjectInt32Param(
+			detectorMarkerHandle,
+			self.sim.objintparam_visibility_layer,
+			DETECTOR_MARKER_HIDDEN_LAYER)
+		self.sim.setObjectSpecialProperty(
+			detectorMarkerHandle, self.sim.objectspecialproperty_renderable)
+		self.sim.setObjectInt32Param(detectorMarkerHandle, self.sim.shapeintparam_static, 1)
+		self.sim.setObjectInt32Param(detectorMarkerHandle, self.sim.shapeintparam_respondable, 0)
+		return detectorMarkerHandle
+
+	def _configure_marker_template_planes(self):
+		"""Configure white visual markers and hidden detector-only colour planes."""
+		templates = {
+			'base': self.baseStationWallTemplateHandle,
+			'victim': self.victimWallTemplateHandle,
+			'rubble_victim': self.rubbleVictimWallTemplateHandle,
+			'hazard': self.hazardWallTemplateHandle,
+		}
+		self.markerPlaneTemplateHandles = {}
+		self.detectorMarkerPlaneTemplateHandles = {}
+		for kind, wallModelHandle in templates.items():
+			markerPlaneHandle = self._find_marker_plane(wallModelHandle)
+			detectorMarkerHandle = self._ensure_detector_marker_plane(
+				wallModelHandle, markerPlaneHandle)
+
+			# The original textured marker remains white for VisionSensor and students.
+			self.sim.setObjectInt32Param(
+				markerPlaneHandle,
+				self.sim.objintparam_visibility_layer,
+				VISUAL_MARKER_VISIBILITY_LAYER)
+			self.sim.setShapeColor(
+				markerPlaneHandle,
+				None,
+				self.sim.colorcomponent_ambient_diffuse,
+				list(VISUAL_MARKER_COLOUR))
+			self.sim.setShapeColor(
+				markerPlaneHandle,
+				None,
+				self.sim.colorcomponent_emission,
+				list(VISUAL_MARKER_COLOUR))
+
+			# The untextured plane supplies a solid detector-safe class colour.
+			self.sim.setShapeColor(
+				detectorMarkerHandle,
+				None,
+				self.sim.colorcomponent_ambient_diffuse,
+				list(MARKER_EMISSIVE_COLOURS[kind]))
+			self.sim.setShapeColor(
+				detectorMarkerHandle,
+				None,
+				self.sim.colorcomponent_emission,
+				list(MARKER_EMISSIVE_COLOURS[kind]))
+			self.markerPlaneTemplateHandles[kind] = markerPlaneHandle
+			self.detectorMarkerPlaneTemplateHandles[kind] = detectorMarkerHandle
 
 	def _grid_point_to_world(self, column, row):
 		"""Convert a maze grid intersection (column, row) into world (x, y) coordinates."""
@@ -1549,26 +1851,42 @@ class COPPELIA_MazeRobot(object):
 			if marker is None:
 				self._create_wall_between_grid_points(startPoint, endPoint, index)
 			else:
-				self._create_wall_between_grid_points(
+				markerWallHandle = self._create_wall_between_grid_points(
 					startPoint,
 					endPoint,
 					index,
 					templateHandle=marker['templateHandle'],
 					alias=marker['alias'],
 					markerCell=marker['cell'])
+				markerPlaneHandle = self._find_marker_plane(markerWallHandle)
+				detectorMarkerHandle = self._find_detector_marker_plane(markerWallHandle)
+				marker['wallHandle'] = markerWallHandle
+				marker['markerHandle'] = markerPlaneHandle
+				marker['detectorMarkerHandle'] = detectorMarkerHandle
+				marker['position'] = self.sim.getObjectPosition(markerPlaneHandle, -1)
+				self.generatedVisualMarkerHandles.append(markerPlaneHandle)
+				self.generatedDetectorMarkerHandles.append(detectorMarkerHandle)
 				self.markerWallPlacements.append(marker)
 			count += 1
 
 		# Defensive fallback for any marker assigned to an unexpected wall segment that is not
 		# present in the configured internal or generated perimeter wall lists.
 		for marker in markerAssignments.values():
-			self._create_wall_between_grid_points(
+			markerWallHandle = self._create_wall_between_grid_points(
 				marker['startPoint'],
 				marker['endPoint'],
 				count,
 				templateHandle=marker['templateHandle'],
 				alias=marker['alias'],
 				markerCell=marker['cell'])
+			markerPlaneHandle = self._find_marker_plane(markerWallHandle)
+			detectorMarkerHandle = self._find_detector_marker_plane(markerWallHandle)
+			marker['wallHandle'] = markerWallHandle
+			marker['markerHandle'] = markerPlaneHandle
+			marker['detectorMarkerHandle'] = detectorMarkerHandle
+			marker['position'] = self.sim.getObjectPosition(markerPlaneHandle, -1)
+			self.generatedVisualMarkerHandles.append(markerPlaneHandle)
+			self.generatedDetectorMarkerHandles.append(detectorMarkerHandle)
 			self.markerWallPlacements.append(marker)
 			count += 1
 
@@ -1595,10 +1913,43 @@ class COPPELIA_MazeRobot(object):
 			self.sim.setObjectOrientation(newHandle, -1, list(self.victimTemplateOrientation))
 			self.sim.setObjectAlias(newHandle, f"EGB320_GEN_VICTIM_{label}")
 			self.sim.setObjectParent(newHandle, self.generatedSceneRootHandle, True)
+			detectorProxyHandle = self._create_victim_detector_proxy(newHandle)
 			self.victimHandles[label] = newHandle
 			self.victimPositions[label] = [x, y, zPos]
+			self.generatedVictimDetectorHandles.append(detectorProxyHandle)
 			count += 1
 		return count
+
+	def _create_victim_detector_proxy(self, victimHandle):
+		"""Create a simple hidden colour proxy that follows one visual victim shape."""
+		boundingBoxSize, boundingBoxPose = self.sim.getShapeBB(victimHandle)
+		# Preserve the victim's bounding-box silhouette, but give very thin dimensions
+		# enough thickness to remain visible in the detector's low-resolution image.
+		proxySize = [max(float(size), 0.025) for size in boundingBoxSize]
+		proxyHandle = self.sim.createPrimitiveShape(
+			self.sim.primitiveshape_cuboid, proxySize, 0)
+		self.sim.setObjectAlias(proxyHandle, 'victim_detector_proxy')
+		self.sim.setObjectParent(proxyHandle, victimHandle, False)
+		self.sim.setObjectPose(proxyHandle, victimHandle, boundingBoxPose)
+		self.sim.setObjectInt32Param(
+			proxyHandle,
+			self.sim.objintparam_visibility_layer,
+			DETECTOR_MARKER_HIDDEN_LAYER)
+		self.sim.setObjectSpecialProperty(
+			proxyHandle, self.sim.objectspecialproperty_renderable)
+		self.sim.setObjectInt32Param(proxyHandle, self.sim.shapeintparam_static, 1)
+		self.sim.setObjectInt32Param(proxyHandle, self.sim.shapeintparam_respondable, 0)
+		self.sim.setShapeColor(
+			proxyHandle,
+			None,
+			self.sim.colorcomponent_ambient_diffuse,
+			list(VICTIM_DETECTOR_COLOUR))
+		self.sim.setShapeColor(
+			proxyHandle,
+			None,
+			self.sim.colorcomponent_emission,
+			list(VICTIM_DETECTOR_COLOUR))
+		return proxyHandle
 
 	def _park_templates_outside_playable_area(self):
 		"""Move all source templates outside the playable area for future regeneration."""
@@ -1739,6 +2090,9 @@ class COPPELIA_MazeRobot(object):
 
 		self.generatedMazeWallHandles = []
 		self.generatedMarkerWallHandles = []
+		self.generatedVisualMarkerHandles = []
+		self.generatedDetectorMarkerHandles = []
+		self.generatedVictimDetectorHandles = []
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
@@ -1907,6 +2261,7 @@ class COPPELIA_MazeRobot(object):
 		# Clear cached values so callers can distinguish an update failure.
 		self.robotPose = None
 		self.cameraPose = None
+		self.cameraForwardYaw = None
 		self.obstaclePositions = [None, None, None]
 
 		# GET 2D ROBOT POSE
@@ -1923,6 +2278,10 @@ class COPPELIA_MazeRobot(object):
 			try:
 				cameraPosition = self.sim.getObjectPosition(self.cameraHandle, -1)
 				cameraOrientation = self.sim.getObjectOrientation(self.cameraHandle, -1)
+				cameraMatrix = self.sim.getObjectMatrix(self.cameraHandle, -1)
+				# CoppeliaSim vision sensors look along local +Z. The mounted sensor's
+				# Euler Z angle is not its horizontal viewing direction.
+				self.cameraForwardYaw = math.atan2(cameraMatrix[6], cameraMatrix[2])
 				self.cameraPose = [
 					cameraPosition[0], cameraPosition[1], cameraPosition[2],
 					cameraOrientation[0], cameraOrientation[1], cameraOrientation[2]]
@@ -1941,7 +2300,8 @@ class COPPELIA_MazeRobot(object):
 	# Checks to see if an Object is within the field of view of the camera
 	def GetRBInCameraFOV(self, objectPosition):
 		# calculate range and bearing on 2D plane - relative to the camera
-		cameraPose2d = [self.cameraPose[0], self.cameraPose[1], self.cameraPose[5]]
+		cameraYaw = self.cameraForwardYaw if self.cameraForwardYaw is not None else self.cameraPose[5]
+		cameraPose2d = [self.cameraPose[0], self.cameraPose[1], cameraYaw]
 		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose2d, objectPosition)
 
 		# vertical_test_cam_pose = [0,self.cameraPose[2],0]
@@ -2236,6 +2596,8 @@ class RobotParameters(object):
 		
 		# Detection Parameters
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m
+		self.maxMarkerDetectionDistance = 1.5    # max distance to detect wall markers in m
+		self.maxVictimDetectionDistance = 1.5    # max distance to detect victim objects in m
 		self.minWallDetectionDistance = 0.02      # min distance for a wall point to be considered valid, in m
 		
 		# Victim collection parameter from the 2026 assessment rules

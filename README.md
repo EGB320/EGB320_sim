@@ -137,8 +137,9 @@ resolution, image_data = robot.GetCameraImage()
 
 ### `GetDetectedObjects(objects=None)`
 
-Returns optional obstacle detections as `[range, bearing]` pairs. An empty list means no
-requested obstacle was detected.
+Returns requested obstacle or marker detections as `[range, bearing]` pairs. An empty list
+means no requested object was detected. With no argument it continues to select all optional
+obstacles for backwards compatibility.
 
 ```python
 from mazebot_lib import mazeObjects
@@ -146,10 +147,54 @@ from mazebot_lib import mazeObjects
 obstacles = robot.GetDetectedObjects([mazeObjects.obstacles])
 for range_m, bearing_rad in obstacles:
     print(range_m, bearing_rad)
+
+victim_markers = robot.GetDetectedObjects([mazeObjects.victimMarker])
 ```
 
 Available selectors are `mazeObjects.obstacle0`, `mazeObjects.obstacle1`,
-`mazeObjects.obstacle2`, and `mazeObjects.obstacles`.
+`mazeObjects.obstacle2`, `mazeObjects.baseStationMarker`, `mazeObjects.victimMarker`,
+`mazeObjects.rubbleVictimMarker`, `mazeObjects.hazardMarker`, and `mazeObjects.victim`
+(`mazeObjects.victimObject` is an equivalent descriptive alias).
+The group selectors are `mazeObjects.obstacles`, `mazeObjects.markers`, and
+`mazeObjects.victims`.
+
+### `GetDetectedMarkers()`
+
+Runs the low-resolution object detector once and retains the object type labels. It returns
+zero-or-one `[range, bearing]` pair under each of the keys `base`, `victim`,
+`rubble_victim`, `hazard`, and `victim_object`; a type that is not visible has an empty list.
+The `victim` key represents the cyan wall marker, while `victim_object` represents the
+separate yellow victim on the ground. When several objects share a class colour, the closest
+matching object in the camera field of view is used.
+
+```python
+markers = robot.GetDetectedMarkers()
+for marker_type, detections in markers.items():
+    for range_m, bearing_rad in detections:
+        print(marker_type, range_m, bearing_rad)
+```
+
+Each marker wall has two child planes. The textured `marker` remains white and is what students
+see through `VisionSensor`. A second untextured `detector_marker` normally has no visible layer.
+One simulator-side call briefly swaps the two planes, renders and processes `ObjectDetector`, and
+restores them without changing CoppeliaSim's global visible-layer selection. Its class colours are blue for the base
+station, cyan for an exposed victim, magenta for a rubble victim, and red for a hazard. The
+structural wall and student-facing marker appearance therefore remain unchanged.
+
+### `GetDetectedVictims()`
+
+Runs the same low-resolution detector and returns zero-or-one `[range, bearing]` pair for
+the closest visible victim. Each yellow visual victim owns a simple, untextured yellow
+`victim_detector_proxy`. The proxy normally has no visible layer and follows the victim when
+it is collected or released. During an object-detector render the Lua helper atomically hides
+the detailed visual model and exposes only the proxy, so `VisionSensor` and the editor retain
+the original victim appearance without adding a second complex mesh.
+
+```python
+victims = robot.GetDetectedVictims()
+if victims:
+    range_m, bearing_rad = victims[0]
+```
 
 ### `UpdateObjectPositions()`
 

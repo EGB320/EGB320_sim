@@ -39,6 +39,8 @@ from mazebot_lib import *
 # Import additional modules
 import os
 import ctypes
+import time
+import math
 
 try:
 	if os.name != 'nt':
@@ -104,7 +106,7 @@ robotParameters.driveSystemQuality = 1            # Drive quality (0-1, 1=perfec
 robotParameters.cameraOrientation = 'landscape'   # Camera orientation
 robotParameters.cameraDistanceFromRobotCenter = 0.0  # Distance from robot center (m)
 robotParameters.cameraHeightFromFloor = 0.15      # Height above floor (m)
-robotParameters.cameraTilt = -0.3                  # Camera tilt angle (radians)
+robotParameters.cameraTilt = -0.1                 # Camera tilt angle (radians)
 
 # Victim collection setting from the assessment rules
 robotParameters.victimCollectionDistance = 0.10  # Maximum horizontal clearance (m)
@@ -144,6 +146,14 @@ if __name__ == '__main__':
 		lastSentCommand = (0.0, 0.0)
 		spaceWasDown = False
 		collectionStatus = "No victim collection attempted."
+		markerDetections = {
+			'base': [],
+			'victim': [],
+			'rubble_victim': [],
+			'hazard': [],
+			'victim_object': [],
+		}
+		nextMarkerDetectionTime = 0.0
 
 		while True:
 			# Send only when the held-key command changes. Releasing the movement keys changes
@@ -184,6 +194,13 @@ if __name__ == '__main__':
 			# Update object positions (required for accurate detection)
 			mazeBotSim.UpdateObjectPositions()
 
+			# The detector is only 32x24, but throttle this example to 10 Hz so terminal
+			# rendering and keyboard polling are not needlessly slowed down.
+			currentTime = time.monotonic()
+			if currentTime >= nextMarkerDetectionTime:
+				markerDetections = mazeBotSim.GetDetectedMarkers()
+				nextMarkerDetectionTime = currentTime + 0.1
+
 			# Clear screen and show current status
 			if show_debug_info:
 				clear_screen()
@@ -207,7 +224,25 @@ if __name__ == '__main__':
 				if mazeBotSim.HasVictim():
 					print(f"Carrying victim: {mazeBotSim.carriedVictimLabel}")
 
-				# Ground-truth victim positions (victim detection is not implemented in this phase)
+				visibleMarkerTypes = [
+					markerType
+					for markerType in ('base', 'victim', 'rubble_victim', 'hazard')
+					if markerDetections[markerType]
+				]
+				print(
+					"Visible wall markers: " +
+					(", ".join(visibleMarkerTypes) if visibleMarkerTypes else "none"))
+
+				if markerDetections['victim_object']:
+					victimRange, victimBearing = markerDetections['victim_object'][0]
+					print(
+						f"Visible yellow victim: range={victimRange:.3f} m, "
+						f"bearing={victimBearing:.3f} rad "
+						f"({math.degrees(victimBearing):.1f} deg)")
+				else:
+					print("Visible yellow victim: none")
+
+				# Ground-truth victim positions for comparison with GetDetectedVictims().
 				for label, position in mazeBotSim.victimPositions.items():
 					print(f"Victim {label} position (x,y,z): {position[0]:0.3f}, {position[1]:0.3f}, {position[2]:0.3f}")
 
