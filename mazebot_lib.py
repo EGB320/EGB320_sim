@@ -602,16 +602,19 @@ class MazeBot(object):
 			x_dot, theta_dot = 0.0, 0.0
 
 		if self.robotParameters.driveType == 'differential':
-			# Robot physical parameters (fixed for the simulation)
-			self.robotParameters.wheelBase = 0.15
-			self.robotParameters.wheelRadius = 0.03
-
 			# Calculate speed limits
 			maxWheelSpeed = self.robotParameters.maximumLinearSpeed / self.robotParameters.wheelRadius
 
-			# Calculate individual wheel speeds
-			leftWheelSpeed = (x_dot - 0.5*theta_dot*self.robotParameters.wheelBase) / self.robotParameters.wheelRadius + self.leftWheelBias
-			rightWheelSpeed = (x_dot + 0.5*theta_dot*self.robotParameters.wheelBase) / self.robotParameters.wheelRadius + self.rightWheelBias
+			# Convert the requested robot motion into left/right wheel angular speeds.
+			# wheelBase is the lateral centre-to-centre separation of the drive wheels.
+			leftWheelSpeed = (
+				(x_dot - 0.5 * theta_dot * self.robotParameters.wheelBase)
+				/ self.robotParameters.wheelRadius
+				+ self.leftWheelBias)
+			rightWheelSpeed = (
+				(x_dot + 0.5 * theta_dot * self.robotParameters.wheelBase)
+				/ self.robotParameters.wheelRadius
+				+ self.rightWheelBias)
 
 			# Add noise if drive system quality is not perfect
 			if self.robotParameters.driveSystemQuality != 1:
@@ -2222,9 +2225,10 @@ class RobotParameters(object):
 		self.maximumLinearSpeed = 0.25  # maximum speed in m/s
 		self.driveSystemQuality = 1.0   # quality from 0 to 1 (1 = perfect)
 		
-		# Wheel Parameters (set automatically for differential drive)
-		self.wheelBase = 0.15           # distance between wheels in m
-		self.wheelRadius = 0.03         # wheel radius in m
+		# Drive-wheel collision geometry. wheelBase is the lateral centre-to-centre
+		# separation between the left and right wheels (not the robot's length).
+		self.wheelBase = 0.08           # wheel separation in metres
+		self.wheelRadius = 0.0245       # collision-wheel radius in metres
 		
 		# Camera Parameters
 		self.cameraOrientation = 'landscape'  # 'landscape' or 'portrait'
