@@ -25,12 +25,19 @@ def main():
         print("The robot is driving forward. Press Ctrl+C to stop.")
 
         while True:
-            # Update the known robot pose before calculating range and bearing.
-            pose, _ = robot.UpdateObjectPositions()
+            # Refresh the internal object positions used to calculate detections.
+            robot.UpdateObjectPositions()
 
             # Read the left, front and right proximity sensors. A value of None means
             # that the sensor did not detect anything within its range.
             walls = robot.GetWallDistances()
+
+            # DEBUG: Display both layers of mobility feedback. Encoders are cumulative
+            # hardware-like counts; odometry is a local pose estimate integrated from
+            # those counts and starts at (0, 0, 0). Comment out these reads and prints
+            # when they are no longer useful to your navigation-system debugging.
+            encoders = robot.GetWheelEncoders()
+            odometry = robot.GetOdometry()
 
             # GetDetections() uses the low-resolution detection camera, but rendering
             # that camera still slows the simulation. If detections are not yet needed
@@ -39,8 +46,9 @@ def main():
             detections = None
             detections = robot.GetDetections()
 
-            print(f"pose: {pose}")
             print(f"wall distances: {walls}")
+            print(f"DEBUG wheel encoders: {encoders}")
+            print(f"DEBUG local odometry: {odometry}")
             print(f"visible objects: {detections}\n")
 
             # OPTIONAL: Read the full colour image from the VisionSensor camera.

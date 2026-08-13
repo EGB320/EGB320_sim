@@ -71,14 +71,52 @@ robot.SetTargetVelocities(0.0, 0.30)   # turn left
 robot.SetTargetVelocities(0.0, 0.0)    # stop
 ```
 
-### Robot pose
+### Wheel encoders and local odometry
+
+The mobility system exposes both raw wheel feedback and a derived local pose:
 
 ```python
-pose, obstacle_positions = robot.UpdateObjectPositions()
+encoders = robot.GetWheelEncoders()
+# {'time': 2.5, 'left_ticks': 1420, 'right_ticks': 1398}
+
+odometry = robot.GetOdometry()
+# {'time': 2.5, 'x': 0.59, 'y': -0.02, 'heading': -0.08}
 ```
 
-`pose` is `[x, y, heading]`, with position in metres and heading in radians. Call this
-before requesting range and bearing detections.
+Encoder counts are signed and cumulative from the last simulator start or
+`ResetWheelEncoders()` call. The Lua robot script accumulates wheel rotation on every
+simulation step, so slow Python loops do not lose complete wheel revolutions. On the
+four-wheel robot, the available front and rear motor encoders are averaged on each side.
+
+`GetOdometry()` integrates the encoder counts using `wheelRadius` and `wheelBase`.
+Its `(x, y, heading)` frame begins at `(0, 0, 0)` when the simulation starts or when
+`ResetOdometry()` is called. It is not the simulator's global pose, and wheel slip or
+incorrect wheel parameters will produce normal odometry drift.
+
+```python
+robot.ResetWheelEncoders()  # Zero counts; preserve the current odometry pose.
+robot.ResetOdometry()       # Zero local pose; preserve the current encoder counts.
+```
+
+The default encoder resolution is 360 counts per wheel revolution. It can be changed
+before creating the robot:
+
+```python
+from mazebot_lib import MazeBot, RobotParameters
+
+parameters = RobotParameters()
+parameters.encoderCountsPerRevolution = 720
+robot = MazeBot(parameters)
+```
+
+### Refreshing object positions
+
+```python
+robot.UpdateObjectPositions()
+```
+
+Call this before requesting range and bearing detections. It refreshes the simulator's
+internal object-position cache and does not return global pose or object-position data.
 
 ### Wall-distance sensors
 

@@ -229,11 +229,15 @@ class MazeBot(object):
 			self.leftWheelBias = random.gauss(0.0, biasStandardDeviation)
 			self.rightWheelBias = random.gauss(0.0, biasStandardDeviation)
 
-		# Object position variables
-		self.robotPose = None
+		# Internal object position variables used to calculate sensor detections
 		self.cameraPose = None
 		self.cameraForwardYaw = None
 		self.obstaclePositions = [None, None, None]
+
+		# Local odometry is deliberately derived from wheel encoder counts, never from
+		# CoppeliaSim's global robot pose. The last counts form the integration baseline.
+		self._odometryPose = [0.0, 0.0, 0.0]
+		self._odometryLastEncoderCounts = None
 
 		# Connect to CoppeliaSim
 		print("Connecting to CoppeliaSim...")
@@ -292,6 +296,9 @@ class MazeBot(object):
 
 		time.sleep(1)
 		self.GetObjectPositions()
+		# Define the local odometry origin after the robot has been placed and allowed
+		# to settle. This samples the encoders but does not alter their public counts.
+		self.ResetOdometry()
 
 	def StopSimulator(self):
 		"""
@@ -640,6 +647,134 @@ class MazeBot(object):
 		elif self.robotParameters.driveType == 'holonomic':
 			print('Holonomic drive not yet implemented')
 
+	def _read_wheel_encoder_angles(self, scriptFunction='getWheelEncoderData'):
+		"""Read one simulator-side encoder sample as time and cumulative wheel angles."""
+		if self.scriptHandle is None:
+			raise RuntimeError('Wheel encoders are unavailable because the Robot script was not found.')
+
+		try:
+			result = self.sim.callScriptFunction(scriptFunction, self.scriptHandle)
+		except Exception as e:
+			raise RuntimeError(
+				'Wheel encoder feedback is unavailable. Ensure the supplied scene contains '
+				'the matching Robot Lua script.') from e
+
+		if not isinstance(result, (list, tuple)) or len(result) != 3:
+			raise RuntimeError(
+				f"Robot script function '{scriptFunction}' returned invalid encoder data: {result!r}")
+
+		sampleTime, leftAngle, rightAngle = result
+		if not all(
+				isinstance(value, (int, float)) and math.isfinite(value)
+				for value in (sampleTime, leftAngle, rightAngle)):
+			raise RuntimeError(
+				f"Robot script function '{scriptFunction}' returned non-finite encoder data: {result!r}")
+
+		return float(sampleTime), float(leftAngle), float(rightAngle)
+
+	def _encoder_sample_from_angles(self, sampleTime, leftAngle, rightAngle):
+		"""Quantize cumulative wheel angles into the configured encoder tick resolution."""
+		countsPerRevolution = self.robotParameters.encoderCountsPerRevolution
+		if (isinstance(countsPerRevolution, bool) or
+				not isinstance(countsPerRevolution, int) or
+				countsPerRevolution <= 0):
+			raise ValueError('encoderCountsPerRevolution must be a positive integer.')
+
+		countsPerRadian = countsPerRevolution / (2.0 * math.pi)
+		return {
+			'time': sampleTime,
+			'left_ticks': int(round(leftAngle * countsPerRadian)),
+			'right_ticks': int(round(rightAngle * countsPerRadian)),
+		}
+
+	def GetWheelEncoders(self):
+		"""
+		Read the cumulative left and right wheel encoder counts.
+
+		Returns:
+			dict: ``{'time': seconds, 'left_ticks': int, 'right_ticks': int}``.
+			Time is CoppeliaSim simulation time. Counts are signed, cumulative values
+			from the last simulator start or :meth:`ResetWheelEncoders` call.
+
+		The Robot Lua script accumulates wheel rotation every simulation step, so full
+		wheel revolutions are retained even when this function is called infrequently.
+		"""
+		return self._encoder_sample_from_angles(
+			*self._read_wheel_encoder_angles('getWheelEncoderData'))
+
+	def ResetWheelEncoders(self):
+		"""
+		Reset both public encoder counters to zero without moving the wheel joints.
+
+		The current odometry pose is preserved. Its count baseline is rebased to the
+		new zero values so resetting the encoders cannot create a false odometry jump.
+		"""
+		sample = self._encoder_sample_from_angles(
+			*self._read_wheel_encoder_angles('resetWheelEncoders'))
+		self._odometryLastEncoderCounts = (
+			sample['left_ticks'], sample['right_ticks'])
+
+	def _update_odometry_from_encoder_sample(self, sample):
+		"""Integrate one cumulative encoder sample using differential-drive kinematics."""
+		currentCounts = (sample['left_ticks'], sample['right_ticks'])
+		if self._odometryLastEncoderCounts is None:
+			self._odometryLastEncoderCounts = currentCounts
+			return
+
+		leftDeltaTicks = currentCounts[0] - self._odometryLastEncoderCounts[0]
+		rightDeltaTicks = currentCounts[1] - self._odometryLastEncoderCounts[1]
+		self._odometryLastEncoderCounts = currentCounts
+
+		wheelRadius = self.robotParameters.wheelRadius
+		wheelBase = self.robotParameters.wheelBase
+		if not math.isfinite(wheelRadius) or wheelRadius <= 0.0:
+			raise ValueError('wheelRadius must be a positive finite value.')
+		if not math.isfinite(wheelBase) or wheelBase <= 0.0:
+			raise ValueError('wheelBase must be a positive finite value.')
+
+		metresPerTick = (
+			2.0 * math.pi * wheelRadius /
+			self.robotParameters.encoderCountsPerRevolution)
+		leftDistance = leftDeltaTicks * metresPerTick
+		rightDistance = rightDeltaTicks * metresPerTick
+		centreDistance = 0.5 * (leftDistance + rightDistance)
+		headingChange = (rightDistance - leftDistance) / wheelBase
+
+		# The midpoint heading is substantially more accurate than the old heading
+		# when the robot translates and turns during the same encoder interval.
+		midpointHeading = self._odometryPose[2] + 0.5 * headingChange
+		self._odometryPose[0] += centreDistance * math.cos(midpointHeading)
+		self._odometryPose[1] += centreDistance * math.sin(midpointHeading)
+		self._odometryPose[2] = self.WrapToPi(
+			self._odometryPose[2] + headingChange)
+
+	def GetOdometry(self):
+		"""
+		Return the robot pose estimated only from wheel encoder counts.
+
+		Returns:
+			dict: ``{'time': seconds, 'x': metres, 'y': metres, 'heading': radians}``.
+
+		The pose is relative to the last simulator start or :meth:`ResetOdometry`
+		call. It is not the simulator's global pose and will naturally accumulate
+		error when wheels slip or the configured wheel geometry is imperfect.
+		"""
+		sample = self.GetWheelEncoders()
+		self._update_odometry_from_encoder_sample(sample)
+		return {
+			'time': sample['time'],
+			'x': self._odometryPose[0],
+			'y': self._odometryPose[1],
+			'heading': self._odometryPose[2],
+		}
+
+	def ResetOdometry(self):
+		"""Set the local odometry pose to ``(0, 0, 0)`` at the current encoder counts."""
+		sample = self.GetWheelEncoders()
+		self._odometryPose = [0.0, 0.0, 0.0]
+		self._odometryLastEncoderCounts = (
+			sample['left_ticks'], sample['right_ticks'])
+
 	def HasVictim(self):
 		"""Return True when a victim is currently attached to VictimCarryPoint."""
 		return self.carriedVictimHandle is not None
@@ -801,16 +936,13 @@ class MazeBot(object):
 
 	def UpdateObjectPositions(self):
 		"""
-		Updates the positions of all objects in the simulation.
+		Refresh the internal object positions used to calculate sensor detections.
 		This should be called in every loop to get accurate object detection.
-		
-		Returns:
-			tuple: (robotPose, obstaclePositions) for debugging purposes
+
+		The robot's global pose and the global object positions are deliberately not
+		returned because they are not measurements available to the navigation system.
 		"""
-		# Get current object positions from CoppeliaSim
 		self.GetObjectPositions()
-		
-		return self.robotPose, self.obstaclePositions
 	########################################
 	##### INTERNAL HELPER FUNCTIONS #######
 	########################################
@@ -2114,23 +2246,13 @@ class MazeBot(object):
 	# The functions below are used internally by the library
 	# Students typically don't need to modify these functions
 
-	# Gets the pose/position in the global coordinate frame of all the objects in the scene.
-	# Stores them in class variables. Variables will be set to none if could not be updated
+	# Cache the camera and optional-object world positions used internally to synthesize
+	# robot-relative detections. Values are set to None if they cannot be refreshed.
 	def GetObjectPositions(self):
 		# Clear cached values so callers can distinguish an update failure.
-		self.robotPose = None
 		self.cameraPose = None
 		self.cameraForwardYaw = None
 		self.obstaclePositions = [None, None, None]
-
-		# GET 2D ROBOT POSE
-		try:
-			robotPosition = self.sim.getObjectPosition(self.robotHandle, -1)
-			robotOrientation = self.sim.getObjectOrientation(self.robotHandle, -1)
-			self.robotPose = [robotPosition[0], robotPosition[1], robotOrientation[2]]
-		except Exception as e:
-			print(f"Error getting robot pose: {e}")
-			robotOrientation = [0.0, 0.0, 0.0]
 
 		# GET 3D CAMERA POSE
 		if self.cameraHandle is not None:
@@ -2189,6 +2311,7 @@ class RobotParameters(object):
 		self.driveType = 'differential'  # currently only 'differential' implemented
 		self.maximumLinearSpeed = 0.25  # maximum speed in m/s
 		self.driveSystemQuality = 1.0   # quality from 0 to 1 (1 = perfect)
+		self.encoderCountsPerRevolution = 360  # signed quadrature counts per wheel turn
 		
 		# Drive-wheel collision geometry. wheelBase is the lateral centre-to-centre
 		# separation between the left and right wheels (not the robot's length).

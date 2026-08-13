@@ -36,7 +36,7 @@ def collect_or_release(robot):
     return 'No victim is close enough to collect.'
 
 
-def show_status(command, walls, detections, collection_status):
+def show_status(command, walls, encoders, odometry, detections, collection_status):
     """Display the latest commands and sensor readings in the terminal."""
     clear_console()
     print('EGB320 MazeBot keyboard control')
@@ -47,6 +47,16 @@ def show_status(command, walls, detections, collection_status):
         f"left={format_distance(walls['left'])}, "
         f"front={format_distance(walls['front'])}, "
         f"right={format_distance(walls['right'])}")
+    print(
+        'DEBUG wheel encoders: '
+        f"left={encoders['left_ticks']} ticks, "
+        f"right={encoders['right_ticks']} ticks, "
+        f"time={encoders['time']:.2f} s")
+    print(
+        'DEBUG local odometry: '
+        f"x={odometry['x']:.3f} m, "
+        f"y={odometry['y']:.3f} m, "
+        f"heading={math.degrees(odometry['heading']):.1f} degrees")
 
     if detections is None:
         print('wall markers: detection camera disabled')
@@ -100,9 +110,16 @@ def main():
 
             current_time = time.monotonic()
             if current_time >= next_display_time:
-                # Update the robot pose, then read the distance and object sensors.
+                # Refresh object positions, then read the distance and object sensors.
                 robot.UpdateObjectPositions()
                 walls = robot.GetWallDistances()
+
+                # DEBUG: Read both the raw mobility feedback and the local pose derived
+                # from it. These values do not expose the simulator's global robot pose.
+                # Comment out these reads and the matching show_status() lines when the
+                # extra display is no longer useful.
+                encoders = robot.GetWheelEncoders()
+                odometry = robot.GetOdometry()
 
                 # GetDetections() uses the low-resolution detection camera, but rendering
                 # that camera still slows the simulation. If detections are not yet needed
@@ -118,7 +135,8 @@ def main():
                 # STUDENTS: This is a useful place to inspect or process sensor data.
                 # For an autonomous program, replace the keyboard-command section above
                 # with code that uses `walls` and `detections` to choose velocities.
-                show_status(command, walls, detections, collection_status)
+                show_status(
+                    command, walls, encoders, odometry, detections, collection_status)
                 next_display_time = current_time + DISPLAY_PERIOD
 
             time.sleep(0.01)

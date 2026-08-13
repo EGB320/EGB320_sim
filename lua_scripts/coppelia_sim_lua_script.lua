@@ -12,6 +12,78 @@ local detectorMarkerHandles = {}
 local visualVictimHandles = {}
 local victimDetectorHandles = {}
 
+-- Encoder state is maintained inside CoppeliaSim instead of in the Python client.
+-- Wheel joints are cyclic and their reported angles wrap after each revolution. Sampling
+-- and unwrapping on every simulation step prevents a slow student loop from losing turns.
+local wheelEncoderStates = {left = {}, right = {}}
+
+local function tryGetObject(path)
+    local ok, handle = pcall(sim.getObject, path)
+    return ok and handle or -1
+end
+
+local function addEncoderJoint(side, path)
+    local handle = tryGetObject(path)
+    if handle == -1 then
+        return
+    end
+
+    local ok, position = pcall(sim.getJointPosition, handle)
+    if ok then
+        wheelEncoderStates[side][#wheelEncoderStates[side] + 1] = {
+            handle = handle,
+            previousPosition = position,
+            cumulativeAngle = 0.0,
+        }
+    end
+end
+
+local function initialiseWheelEncoders()
+    wheelEncoderStates = {left = {}, right = {}}
+
+    -- The front motors are required by the Python API. Rear motors are optional, so
+    -- two-wheel and four-wheel versions of the robot share the same encoder interface.
+    addEncoderJoint('left', '/LeftMotor')
+    addEncoderJoint('left', '/LeftRearMotor')
+    addEncoderJoint('right', '/RightMotor')
+    addEncoderJoint('right', '/RightRearMotor')
+end
+
+local function wrappedAngleDifference(currentPosition, previousPosition)
+    local difference = currentPosition - previousPosition
+    if difference > math.pi then
+        difference = difference - 2.0 * math.pi
+    elseif difference < -math.pi then
+        difference = difference + 2.0 * math.pi
+    end
+    return difference
+end
+
+local function updateWheelEncoders()
+    for _, states in pairs(wheelEncoderStates) do
+        for _, state in ipairs(states) do
+            local ok, position = pcall(sim.getJointPosition, state.handle)
+            if ok then
+                state.cumulativeAngle = state.cumulativeAngle +
+                    wrappedAngleDifference(position, state.previousPosition)
+                state.previousPosition = position
+            end
+        end
+    end
+end
+
+local function meanCumulativeAngle(states)
+    if #states == 0 then
+        return 0.0
+    end
+
+    local total = 0.0
+    for _, state in ipairs(states) do
+        total = total + state.cumulativeAngle
+    end
+    return total / #states
+end
+
 local function refreshGeneratedMarkerHandles()
     visualMarkerHandles = {}
     detectorMarkerHandles = {}
@@ -125,6 +197,23 @@ end
 function sysCall_init()
     print('Initializing EGB320 search and rescue maze robot script...')
     refreshGeneratedMarkerHandles()
+    initialiseWheelEncoders()
+end
+
+-- Called by mazebot_lib.py. Angles are cumulative radians since simulation start or
+-- resetWheelEncoders(), averaged across the available motors on each side of the robot.
+-- Python performs the configurable encoder quantisation and odometry integration.
+function getWheelEncoderData()
+    return sim.getSimulationTime(),
+        meanCumulativeAngle(wheelEncoderStates.left),
+        meanCumulativeAngle(wheelEncoderStates.right)
+end
+
+-- Reset the logical encoder counters without changing the physical joint positions.
+-- Returning the new sample lets Python rebase odometry atomically with the reset.
+function resetWheelEncoders()
+    initialiseWheelEncoders()
+    return sim.getSimulationTime(), 0.0, 0.0
 end
 
 -- Called by mazebot_lib.py. All visibility changes and the detector render occur
@@ -167,7 +256,9 @@ function sysCall_actuation()
 end
 
 function sysCall_sensing()
-    -- Camera and proximity sensors are read directly by the Python API.
+    -- Accumulate wheel motion before Python can request the next encoder sample.
+    updateWheelEncoders()
+    -- Camera and proximity sensors are otherwise read directly by the Python API.
 end
 
 function sysCall_cleanup()
