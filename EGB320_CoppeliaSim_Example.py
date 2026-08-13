@@ -6,7 +6,7 @@ Press Ctrl+C in the terminal to stop.
 
 import time
 
-from mazebot_lib import MazeBot
+from mazebot_lib import MazeBot, RobotParameters
 
 
 FORWARD_SPEED = 0.08  # metres per second
@@ -15,7 +15,10 @@ FORWARD_SPEED = 0.08  # metres per second
 def main():
     # Create the robot interface using the default robot and maze settings.
     # CoppeliaSim must already be open with the supplied scene loaded.
-    robot = MazeBot()
+    parameters = RobotParameters()
+    # Choose 'legacy' (stable default) or 'opengl3' for the ObjectDetector renderer.
+    parameters.objectDetectorRenderer = 'legacy'
+    robot = MazeBot(parameters)
     robot.StartSimulator()
 
     try:

@@ -1,16 +1,9 @@
 simVision = require('simVision')
 sim = require('sim')
 
-function sysCall_init()
-    -- Inherit the parent camera's visible-RGB renderer. Render mode 1 is CoppeliaSim's
-    -- object-ID colour mode and makes colour detection impossible.
-    local ok, handle = pcall(sim.getObject, '.')
-    if ok then
-        local parentHandle = sim.getObjectParent(handle)
-        local renderMode = sim.getObjectInt32Param(parentHandle, sim.visionintparam_render_mode)
-        sim.setObjectInt32Param(handle, sim.visionintparam_render_mode, renderMode)
-    end
-end
+-- The detector renderer is configured by RobotParameters.objectDetectorRenderer in
+-- mazebot_lib.py. Do not inherit the parent camera renderer here: doing so would
+-- silently overwrite the student's Legacy OpenGL/OpenGL3 selection at simulation start.
 
 function sysCall_vision(inData)
     -- Packet order (also used by mazeObjects in mazebot_lib.py):

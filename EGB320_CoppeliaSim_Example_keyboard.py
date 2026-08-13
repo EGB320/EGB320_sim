@@ -84,6 +84,8 @@ def main():
     parameters = RobotParameters()
     parameters.cameraDistanceFromRobotCenter = 0.0
     parameters.cameraTilt = -0.1
+    # Choose 'legacy' (stable default) or 'opengl3' for the ObjectDetector renderer.
+    parameters.objectDetectorRenderer = 'legacy'
 
     # Connect to the supplied scene and generate the default maze.
     robot = MazeBot(parameters)

@@ -97,6 +97,14 @@ VISUAL_MARKER_VISIBILITY_LAYER = 1
 DETECTOR_MARKER_HIDDEN_LAYER = 0
 DETECTOR_MARKER_FACE_OFFSET = 0.0002
 
+# CoppeliaSim's documented Legacy OpenGL vision-sensor mode is 0. OpenGL3 is an
+# optional plugin renderer selected with mode 7. Students choose between these names
+# through RobotParameters rather than depending on CoppeliaSim's numeric mode values.
+OBJECT_DETECTOR_RENDER_MODES = {
+	'legacy': ('Legacy OpenGL', 0),
+	'opengl3': ('OpenGL3', 7),
+}
+
 
 
 # Object types retained for the search-and-rescue challenge.
@@ -1194,26 +1202,47 @@ class MazeBot(object):
 	###############################################
 	# These functions are called within the init function
 
-	# Updates the robot within COPPELIA based on the robot paramters
+	def _get_object_detector_render_mode(self):
+		"""Validate the public renderer name and return its display name and mode value."""
+		renderer = self.robotParameters.objectDetectorRenderer
+		if not isinstance(renderer, str):
+			raise ValueError(
+				"objectDetectorRenderer must be either 'legacy' or 'opengl3'.")
+
+		renderer = renderer.strip().lower()
+		if renderer not in OBJECT_DETECTOR_RENDER_MODES:
+			raise ValueError(
+				f"Unknown objectDetectorRenderer {self.robotParameters.objectDetectorRenderer!r}. "
+				"Use 'legacy' or 'opengl3'.")
+
+		# Store the normalized spelling so diagnostics and later inspection are stable.
+		self.robotParameters.objectDetectorRenderer = renderer
+		return OBJECT_DETECTOR_RENDER_MODES[renderer]
+
+	# Updates the robot within COPPELIA based on the robot parameters
 	def UpdateCOPPELIARobot(self):
+		rendererDisplayName, rendererMode = self._get_object_detector_render_mode()
+
 		# Set Camera Pose and Orientation (skipped if no VisionSensor was resolved)
 		if self.cameraHandle is None:
 			print("Note: skipping camera pose/orientation setup - no VisionSensor resolved.")
-			return
-		self.SetCameraPose(self.robotParameters.cameraDistanceFromRobotCenter, self.robotParameters.cameraHeightFromFloor, self.robotParameters.cameraTilt)
-		self.SetCameraOrientation(self.robotParameters.cameraOrientation)
+		else:
+			self.SetCameraPose(self.robotParameters.cameraDistanceFromRobotCenter, self.robotParameters.cameraHeightFromFloor, self.robotParameters.cameraTilt)
+			self.SetCameraOrientation(self.robotParameters.cameraOrientation)
+
 		if self.objectDetectorHandle is not None:
 			try:
-				# The detector must render visible RGB colours, not CoppeliaSim's object-ID
-				# colour mode. Reuse the main camera's known-good renderer setting.
-				renderMode = self.sim.getObjectInt32Param(
-					self.cameraHandle, self.sim.visionintparam_render_mode)
+				# Configure the detector independently from the full-resolution camera. The
+				# detector needs visible RGB colours, so object-ID colour mode is not valid.
 				self.sim.setObjectInt32Param(
-					self.objectDetectorHandle, self.sim.visionintparam_render_mode, renderMode)
+					self.objectDetectorHandle,
+					self.sim.visionintparam_render_mode,
+					rendererMode)
 				self.sim.setObjectInt32Param(
 					self.objectDetectorHandle,
 					self.sim.objintparam_visibility_layer,
 					DETECTOR_MARKER_HIDDEN_LAYER)
+				print(f"ObjectDetector renderer: {rendererDisplayName}.")
 			except Exception as e:
 				print(f"Warning: could not configure ObjectDetector render mode: {e}")
 
@@ -2326,6 +2355,9 @@ class RobotParameters(object):
 		self.cameraResolutionX = 640          # camera width in pixels
 		self.cameraResolutionY = 480          # camera height in pixels
 		self.cameraPerspectiveAngle = math.pi/3  # field of view angle in radians
+		# Low-resolution colour detector renderer. 'legacy' is the stable default;
+		# 'opengl3' opts into CoppeliaSim's optional simOpenGL3 plugin renderer.
+		self.objectDetectorRenderer = 'legacy'
 		
 		# Detection Parameters
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m

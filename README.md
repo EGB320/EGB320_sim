@@ -161,6 +161,25 @@ if yellow_victims:
 
 `GetDetectedVictims()` is also available when only the yellow victim is needed.
 
+#### ObjectDetector renderer
+
+The low-resolution colour detector can use either CoppeliaSim renderer:
+
+```python
+from mazebot_lib import MazeBot, RobotParameters
+
+parameters = RobotParameters()
+parameters.objectDetectorRenderer = 'legacy'  # Stable default: Legacy OpenGL
+# parameters.objectDetectorRenderer = 'opengl3'  # Optional simOpenGL3 renderer
+
+robot = MazeBot(parameters)
+```
+
+Legacy OpenGL is recommended because the ObjectDetector only needs flat RGB colours.
+OpenGL3 is available for comparison or systems where it is known to be stable, but its
+GPU-driver/plugin path may be less reliable on some computers. An unknown value raises a
+clear `ValueError` during robot initialization.
+
 ### Camera image
 
 ```python
