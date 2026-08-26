@@ -11,69 +11,22 @@ import time
 from enum import IntEnum
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from maze_generation import (
+	MazeLayout,
+	PRESET_BASE_CELL,
+	PRESET_BASE_YAW,
+	PRESET_MAZE_SEGMENTS,
+	PRESET_VICTIM_CELLS,
+	generate_random_maze,
+	validate_maze_layout,
+)
 
 
 # Deterministic example maze layout: internal wall segments between grid
 # intersections. Each entry is ((startColumn, startRow), (endColumn, endRow)) using the
 # grid intersection convention described in SetScene/_grid_point_to_world. Intentionally
 # not merged/optimised so each entry corresponds to one generated internal wall copy.
-EXAMPLE_MAZE_SEGMENTS = [
-	((4, 0), (4, 1)),
-
-	((1, 1), (2, 1)),
-	((2, 1), (2, 2)),
-
-	((3, 1), (3, 2)),
-	((3, 2), (3, 3)),
-
-	((5, 1), (6, 1)),
-	((6, 1), (6, 2)),
-	((6, 2), (6, 3)),
-
-	((5, 1), (5, 2)),
-	((5, 2), (5, 3)),
-	((5, 3), (5, 4)),
-
-	((1, 2), (2, 2)),
-	((1, 3), (2, 3)),
-	((2, 2), (2, 3)),
-
-	((3, 2), (4, 2)),
-	((4, 2), (5, 2)),
-
-	((1, 3), (1, 4)),
-
-	((2, 3), (3, 3)),
-	((2, 3), (2, 4)),
-	((2, 4), (2, 5)),
-	((2, 5), (2, 6)),
-	((2, 4), (3, 3)),
-
-	((3, 4), (4, 3)),
-
-	# Keep the long starting corridor separate from the cells immediately to its east.
-	((1, 4), (1, 5)),
-
-	((3, 4), (4, 4)),
-	((4, 4), (5, 4)),
-
-	((6, 4), (7, 4)),
-
-	((3, 4), (3, 5)),
-
-	((1, 5), (1, 6)),
-	((1, 6), (1, 7)),
-	((4, 5), (4, 6)),
-
-	((5, 4), (5, 5)),
-	((5, 5), (5, 6)),
-	((5, 5), (6, 5)),
-
-	((4, 6), (5, 6)),
-	((5, 6), (6, 6)),
-
-	((3, 6), (3, 7)),
-]
+EXAMPLE_MAZE_SEGMENTS = list(PRESET_MAZE_SEGMENTS)
 
 # Small separation used when placing a victim on either the maze floor or robot chassis.
 VICTIM_SURFACE_CLEARANCE = 0.001
@@ -210,12 +163,14 @@ class MazeBot(object):
 		self.generatedVisualMarkerHandles = []
 		self.generatedDetectorMarkerHandles = []
 		self.generatedVictimDetectorHandles = []
+		self.victimDetectorHandles = {}
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
 		self.markerWallPlacements = []
 		self.carriedVictimHandle = None
 		self.carriedVictimLabel = None
+		self.deliveredVictimLabels = set()
 
 		# Cached maze geometry (populated by _get_floor_info/_cache_template_geometry)
 		self.floorCenter = None
@@ -273,16 +228,16 @@ class MazeBot(object):
 		Starts the CoppeliaSim simulation.
 		Can also be started manually by pressing the Play button in CoppeliaSim.
 
-		The maze (posts, walls, victims) is generated deterministically while the
-		simulation is stopped, so that starting/stopping/starting again never leaves
-		duplicate generated objects in the scene.
+		The selected preset or random maze (posts, walls, victims) is generated while
+		the simulation is stopped. Existing generated objects are cleared first, so
+		starting/stopping/starting again never leaves duplicates in the scene.
 		"""
 		print('Starting CoppeliaSim simulation...')
 
 		try:
 			simState = self.sim.getSimulationState()
 			if simState != self.sim.simulation_stopped:
-				print('Simulation is currently running - stopping it to (re)generate the scene deterministically...')
+				print('Simulation is currently running - stopping it to (re)generate the scene...')
 				self.sim.stopSimulation()
 				while self.sim.getSimulationState() != self.sim.simulation_stopped:
 					time.sleep(0.05)
@@ -480,7 +435,8 @@ class MazeBot(object):
 
 		candidates = []
 		for label, victimHandle in self.victimHandles.items():
-			if victimHandle == self.carriedVictimHandle:
+			if (victimHandle == self.carriedVictimHandle or
+					label in self.deliveredVictimLabels):
 				continue
 			try:
 				position = self.sim.getObjectPosition(victimHandle, -1)
@@ -617,7 +573,9 @@ class MazeBot(object):
 			maxWheelSpeed = self.robotParameters.maximumLinearSpeed / self.robotParameters.wheelRadius
 
 			# Convert the requested robot motion into left/right wheel angular speeds.
-			# wheelBase is the lateral centre-to-centre separation of the drive wheels.
+			# wheelBase is the calibrated effective track width.  For a four-wheel
+			# skid-steer chassis this is wider than the geometric left/right spacing
+			# because the tyres must also scrub sideways while the robot turns.
 			leftWheelSpeed = (
 				(x_dot - 0.5 * theta_dot * self.robotParameters.wheelBase)
 				/ self.robotParameters.wheelRadius
@@ -862,6 +820,8 @@ class MazeBot(object):
 				robotCollectionHandle, self.sim.handle_tree, self.robotHandle, 0)
 
 			for label, victimHandle in self.victimHandles.items():
+				if label in self.deliveredVictimLabels:
+					continue
 				try:
 					distance = self._get_horizontal_robot_to_victim_distance(
 						victimHandle, robotCollectionHandle)
@@ -898,7 +858,7 @@ class MazeBot(object):
 		print(f"Collected victim {closestLabel} (distance: {closestDistance:.3f} m).")
 		return True, closestLabel, closestDistance
 
-	def ReleaseVictim(self):
+	def ReleaseVictim(self, forward_offset=None, lateral_offset=0.0, delivered=False):
 		"""
 		Place the currently carried victim back onto the maze floor.
 
@@ -906,12 +866,28 @@ class MazeBot(object):
 		the chassis. Its original floor orientation is restored and its lowest transformed
 		bounding-box corner is placed 1 mm above the floor.
 
+		Args:
+			forward_offset: Optional metres forward from the robot centre. ``None`` uses
+				the normal release offset.
+			lateral_offset: Metres to the robot's left, useful for separating several
+				victims in one base drop zone.
+			delivered: If True, permanently exclude this victim from later collection and
+				detection and make it invisible to proximity sensors.
+
 		Returns:
 			tuple: (success, victim_label), with victim_label set to None on failure.
 		"""
 		if not self.HasVictim():
 			print("Release failed: the robot is not carrying a victim.")
 			return False, None
+		if forward_offset is None:
+			forward_offset = VICTIM_RELEASE_FORWARD_OFFSET
+		if (not isinstance(forward_offset, (int, float)) or
+				not math.isfinite(forward_offset) or forward_offset < 0.0):
+			raise ValueError('forward_offset must be a non-negative finite value')
+		if (not isinstance(lateral_offset, (int, float)) or
+				not math.isfinite(lateral_offset)):
+			raise ValueError('lateral_offset must be a finite value')
 
 		victimHandle = self.carriedVictimHandle
 		victimLabel = self.carriedVictimLabel
@@ -919,8 +895,12 @@ class MazeBot(object):
 			robotPosition = self.sim.getObjectPosition(self.robotHandle, -1)
 			robotOrientation = self.sim.getObjectOrientation(self.robotHandle, -1)
 			robotYaw = robotOrientation[2]
-			dropX = robotPosition[0] + VICTIM_RELEASE_FORWARD_OFFSET * math.cos(robotYaw)
-			dropY = robotPosition[1] + VICTIM_RELEASE_FORWARD_OFFSET * math.sin(robotYaw)
+			dropX = (
+				robotPosition[0] + forward_offset * math.cos(robotYaw) -
+				lateral_offset * math.sin(robotYaw))
+			dropY = (
+				robotPosition[1] + forward_offset * math.sin(robotYaw) +
+				lateral_offset * math.cos(robotYaw))
 
 			victimMinimumZ, _ = self._get_oriented_shape_z_extent(
 				victimHandle, self.victimTemplateOrientation)
@@ -934,6 +914,26 @@ class MazeBot(object):
 			self.sim.setObjectPosition(victimHandle, -1, [dropX, dropY, dropZ])
 
 			self.victimPositions[victimLabel] = [dropX, dropY, dropZ]
+			if delivered:
+				self.deliveredVictimLabels.add(victimLabel)
+				# Keep the delivered victim visible in the base drop zone, but prevent it
+				# from appearing as a close wall or a new yellow detector target.
+				detectorProxyHandle = getattr(
+					self, 'victimDetectorHandles', {}).get(victimLabel)
+				for shapeHandle in self.sim.getObjectsInTree(
+						victimHandle, self.sim.object_shape_type, 0):
+					try:
+						specialProperties = self.sim.getObjectSpecialProperty(shapeHandle)
+						if shapeHandle == detectorProxyHandle:
+							specialProperties &= ~self.sim.objectspecialproperty_renderable
+						else:
+							specialProperties &= ~self.sim.objectspecialproperty_detectable_all
+						self.sim.setObjectSpecialProperty(
+							shapeHandle, specialProperties)
+					except Exception as e:
+						print(
+							f"Warning: could not disable proximity detection for "
+							f"delivered victim {victimLabel}: {e}")
 			self.carriedVictimHandle = None
 			self.carriedVictimLabel = None
 			print(f"Released victim {victimLabel} onto the maze floor.")
@@ -1222,6 +1222,7 @@ class MazeBot(object):
 	# Updates the robot within COPPELIA based on the robot parameters
 	def UpdateCOPPELIARobot(self):
 		rendererDisplayName, rendererMode = self._get_object_detector_render_mode()
+		self._configure_skid_steer_contact_geometry()
 
 		# Set Camera Pose and Orientation (skipped if no VisionSensor was resolved)
 		if self.cameraHandle is None:
@@ -1246,6 +1247,51 @@ class MazeBot(object):
 			except Exception as e:
 				print(f"Warning: could not configure ObjectDetector render mode: {e}")
 
+	def _configure_skid_steer_contact_geometry(self):
+		"""Place four-wheel contact axles for reliable centre-point turns.
+
+		A rigid four-wheel chassis cannot turn like an ideal differential-drive robot
+		unless its tyres scrub sideways.  The original axles were far enough apart that
+		Bullet often resisted or stalled an in-place turn.  Moving the physical contact
+		axles slightly toward the chassis centre keeps four driven/supporting wheels but
+		reduces the opposing scrub torque symmetrically.  The calibrated geometry turns
+		about the robot centre without the large translation caused by lowering only one
+		axle's friction.
+		"""
+		if self.robotParameters.driveType != 'differential':
+			return
+		if (getattr(self, 'leftRearMotorHandle', None) is None or
+				getattr(self, 'rightRearMotorHandle', None) is None):
+			# A two-wheel differential robot already has one central drive axle.
+			return
+
+		offset = self.robotParameters.wheelAxleLongitudinalOffset
+		if not math.isfinite(offset) or offset < 0.0:
+			raise ValueError(
+				'wheelAxleLongitudinalOffset must be a non-negative finite value.')
+
+		motorPlacements = (
+			(self.leftMotorHandle, offset),
+			(self.rightMotorHandle, offset),
+			(self.leftRearMotorHandle, -offset),
+			(self.rightRearMotorHandle, -offset),
+		)
+		for motorHandle, longitudinalPosition in motorPlacements:
+			position = self.sim.getObjectPosition(motorHandle, self.robotHandle)
+			position[0] = longitudinalPosition
+			self.sim.setObjectPosition(motorHandle, self.robotHandle, position)
+			# Imported mesh poses contained small, different angular errors on each
+			# corner. Exact motor axes and collision-wheel poses make clockwise and
+			# counter-clockwise contact forces symmetric.
+			self.sim.setObjectOrientation(
+				motorHandle, self.robotHandle, [-math.pi / 2.0, 0.0, 0.0])
+
+			wheelHandle = self.sim.getObjectChild(motorHandle, 0)
+			if wheelHandle != -1 and self.sim.getObjectType(wheelHandle) == self.sim.object_shape_type:
+				self.sim.setObjectPosition(wheelHandle, motorHandle, [0.0, 0.0, 0.0])
+				self.sim.setObjectOrientation(
+					wheelHandle, motorHandle, [0.0, -math.pi / 2.0, 0.0])
+
 	def SetScene(self):
 		"""
 		Builds the static EGB320 search and rescue maze scene.
@@ -1261,6 +1307,10 @@ class MazeBot(object):
 			print('autoGenerateMaze is False - skipping maze generation.')
 			return
 
+		# Select the fixed teaching maze or generate a fresh validated random topology
+		# before any CoppeliaSim objects are copied. An integer seed reproduces the same
+		# random maze; a None seed intentionally chooses a new one on every start.
+		self.sceneParameters.prepare_maze_layout(force_random=True)
 		self.sceneParameters.validate_maze_parameters()
 
 		if self.sceneParameters.clearGeneratedMaze:
@@ -1629,7 +1679,7 @@ class MazeBot(object):
 		column, row = cell
 		axisAlignedWalls = {
 			self._normalise_grid_segment(startPoint, endPoint)
-			for startPoint, endPoint in EXAMPLE_MAZE_SEGMENTS
+			for startPoint, endPoint in self.sceneParameters.mazeWallSegments
 			if startPoint[0] == endPoint[0] or startPoint[1] == endPoint[1]
 		}
 		boundarySides = {
@@ -1679,20 +1729,11 @@ class MazeBot(object):
 		baseCell = tuple(self.sceneParameters.baseCell)
 		baseWalls = self._cell_wall_sides(baseCell)
 		baseOpenSides = [side for side, closed in baseWalls.items() if not closed]
-		if len(baseOpenSides) == 1:
-			baseMarkerSide = oppositeDirection[baseOpenSides[0]]
-		else:
-			baseBoundarySides = [
-				side for side in ('S', 'W', 'N', 'E')
-				if baseWalls[side] and (
-					(side == 'N' and baseCell[1] == 0) or
-					(side == 'E' and baseCell[0] == self.sceneParameters.mazeColumns - 1) or
-					(side == 'S' and baseCell[1] == self.sceneParameters.mazeRows - 1) or
-					(side == 'W' and baseCell[0] == 0))
-			]
-			if not baseBoundarySides:
-				raise ValueError(f"Base cell {baseCell} has no suitable wall for the base marker")
-			baseMarkerSide = baseBoundarySides[0]
+		if len(baseOpenSides) != 1:
+			raise ValueError(
+				f"Base cell {baseCell} must have exactly one open side "
+				f"(found {baseOpenSides})")
+		baseMarkerSide = oppositeDirection[baseOpenSides[0]]
 		assign('base', baseCell, baseMarkerSide, self.baseStationWallTemplateHandle, 'EGB320_GEN_BASE_STATION_WALL')
 
 		# Victims must occupy three-sided dead ends. Put each marker on the terminal wall
@@ -1868,7 +1909,7 @@ class MazeBot(object):
 		"""Create all internal/perimeter walls, substituting marker walls where required."""
 		markerAssignments = self._plan_marker_walls()
 		self.markerWallPlacements = []
-		wallSegments = list(EXAMPLE_MAZE_SEGMENTS)
+		wallSegments = list(self.sceneParameters.mazeWallSegments)
 		seenSegments = {
 			self._normalise_grid_segment(startPoint, endPoint)
 			for startPoint, endPoint in wallSegments
@@ -1944,6 +1985,16 @@ class MazeBot(object):
 			column, row = cell
 			x, y = self._cell_center_to_world(column, row)
 			newHandle = self.sim.copyPasteObjects([self.victimTemplateHandle], 0)[0]
+			# Victims are targets to collect, not physical obstacles.  In particular, the
+			# robot must be able to enter the 0.10 m collection envelope before calling
+			# CollectVictim().  Do this on every shape in case the victim template is later
+			# changed from a single shape into a model with several child shapes.
+			for shapeHandle in self.sim.getObjectsInTree(
+					newHandle, self.sim.object_shape_type, 0):
+				self.sim.setObjectInt32Param(
+					shapeHandle, self.sim.shapeintparam_static, 1)
+				self.sim.setObjectInt32Param(
+					shapeHandle, self.sim.shapeintparam_respondable, 0)
 			self.sim.setObjectPosition(newHandle, -1, [x, y, zPos])
 			self.sim.setObjectOrientation(newHandle, -1, list(self.victimTemplateOrientation))
 			self.sim.setObjectAlias(newHandle, f"EGB320_GEN_VICTIM_{label}")
@@ -1952,6 +2003,7 @@ class MazeBot(object):
 			self.victimHandles[label] = newHandle
 			self.victimPositions[label] = [x, y, zPos]
 			self.generatedVictimDetectorHandles.append(detectorProxyHandle)
+			self.victimDetectorHandles[label] = detectorProxyHandle
 			count += 1
 		return count
 
@@ -2128,12 +2180,14 @@ class MazeBot(object):
 		self.generatedVisualMarkerHandles = []
 		self.generatedDetectorMarkerHandles = []
 		self.generatedVictimDetectorHandles = []
+		self.victimDetectorHandles = {}
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
 		self.markerWallPlacements = []
 		self.carriedVictimHandle = None
 		self.carriedVictimLabel = None
+		self.deliveredVictimLabels = set()
 
 		print(f"Cleanup removed {removedCount} previously generated object(s).")
 		return removedCount
@@ -2159,8 +2213,15 @@ class MazeBot(object):
 			f"base={markerCounts['base']}, exposed victims={markerCounts['victim']}, "
 			f"trapped victims={markerCounts['rubble_victim']}, hazards={markerCounts['hazard']}")
 		print(f"Victims created: {victimCount}")
+		print(f"Maze source: {self.sceneParameters.mazeGenerationMode}")
+		if self.sceneParameters.activeMazeSeed is not None:
+			print(
+				f"Random maze seed: {self.sceneParameters.activeMazeSeed} "
+				f"(accepted on attempt {self.sceneParameters.mazeGenerationAttempt})")
 		print(f"Base cell: {tuple(self.sceneParameters.baseCell)}")
 		print(f"Victim cells: {victimCellsText}")
+		print(f"Victim path distances: {self.sceneParameters.mazeVictimDistances}")
+		print(f"Hazard dead-end cells: {self.sceneParameters.mazeHazardCells}")
 		print(f"Objects removed during cleanup: {removedCount}")
 
 	def _set_obstacle_positions(self):
@@ -2342,10 +2403,14 @@ class RobotParameters(object):
 		self.driveSystemQuality = 1.0   # quality from 0 to 1 (1 = perfect)
 		self.encoderCountsPerRevolution = 360  # signed quadrature counts per wheel turn
 		
-		# Drive-wheel collision geometry. wheelBase is the lateral centre-to-centre
-		# separation between the left and right wheels (not the robot's length).
-		self.wheelBase = 0.08           # wheel separation in metres
+		# Calibrated effective track width for this four-wheel skid-steer robot.  It is
+		# intentionally wider than the geometric wheel spacing because tyre scrub makes
+		# the chassis turn less than an ideal two-wheel differential-drive model.
+		self.wheelBase = 0.145          # effective wheel separation in metres
 		self.wheelRadius = 0.0245       # collision-wheel radius in metres
+		# Distance from the robot centre to each physical front/rear axle. The original
+		# 0.04 m offset created excessive opposing tyre scrub during in-place turns.
+		self.wheelAxleLongitudinalOffset = 0.03  # front=+offset, rear=-offset
 		
 		# Camera Parameters
 		self.cameraOrientation = 'landscape'  # 'landscape' or 'portrait'
@@ -2380,15 +2445,34 @@ class SceneParameters(object):
 		# False clears previously generated objects but creates no posts, walls or victims.
 		# The templates are still parked off-table and the robot is placed normally.
 		self.generateMazeObjects = True
-		self.baseCell = (0, 6)
-		self.baseYaw = math.pi / 2
+
+		# Select 'preset' for the original hand-authored teaching maze or 'random' for a
+		# new challenge maze. Set randomMazeSeed to an integer to reproduce a layout;
+		# leave it as None to choose a fresh seed whenever StartSimulator() builds a scene.
+		self.mazeGenerationMode = 'preset'
+		self.randomMazeSeed = None
+		self.randomMazeMaximumAttempts = 1000
+		self.randomMazeBaseOpeningSide = 'N'
+
+		# Public preset fields make switching from random back to the original maze
+		# explicit. mazeWallSegments/baseCell/victimCells below always describe the
+		# currently active layout and are what the renderer consumes.
+		self.presetMazeWallSegments = list(EXAMPLE_MAZE_SEGMENTS)
+		self.presetBaseCell = tuple(PRESET_BASE_CELL)
+		self.presetBaseYaw = PRESET_BASE_YAW
+		self.presetVictimCells = dict(PRESET_VICTIM_CELLS)
+		self.mazeWallSegments = list(self.presetMazeWallSegments)
+		self.baseCell = tuple(self.presetBaseCell)
+		self.baseYaw = self.presetBaseYaw
 		# Each victim is in a three-sided dead end. The associated marker is generated on
 		# the terminal wall opposite the one open side (see _plan_marker_walls).
-		self.victimCells = {
-			"L1": (1, 2),
-			"L2": (5, 1),
-			"L3": (4, 5),
-		}
+		self.victimCells = dict(self.presetVictimCells)
+		self.activeMazeSeed = None
+		self.mazeGenerationAttempt = 1
+		self.mazeVictimDistances = {}
+		self.mazeHazardCells = []
+		self.activeMazeLayout = None
+		self._activeMazeMode = 'preset'
 		self.placeRobotAtBase = True
 
 		# Robot starting position [x, y, theta] in metres and radians.
@@ -2401,6 +2485,86 @@ class SceneParameters(object):
 		self.obstacle1_StartingPosition = None
 		self.obstacle2_StartingPosition = None
 
+	def _apply_maze_layout(self, layout):
+		"""Copy a topology-only :class:`MazeLayout` into the active scene fields."""
+		self.mazeWallSegments = [
+			(tuple(startPoint), tuple(endPoint))
+			for startPoint, endPoint in layout.wall_segments
+		]
+		self.baseCell = tuple(layout.base_cell)
+		self.victimCells = {
+			label: tuple(cell) for label, cell in layout.victim_cells.items()
+		}
+		self.activeMazeSeed = layout.seed
+		self.mazeGenerationAttempt = layout.generation_attempt
+		self.mazeVictimDistances = {
+			label: layout.distances_from_base.get(tuple(cell))
+			for label, cell in layout.victim_cells.items()
+		}
+		self.mazeHazardCells = [tuple(cell) for cell in layout.hazard_cells]
+		self.activeMazeLayout = layout
+		self._activeMazeMode = layout.mode
+
+	def prepare_maze_layout(self, force_random=False):
+		"""Select or generate the active topology before scene objects are created.
+
+		``force_random`` is used by :meth:`MazeBot.SetScene` so each simulator start is a
+		new generation step. An integer ``randomMazeSeed`` still gives the same topology
+		on every start, which is useful for demonstrations and debugging.
+		"""
+		mode = str(self.mazeGenerationMode).strip().lower()
+		if mode not in ('preset', 'random'):
+			raise ValueError(
+				"mazeGenerationMode must be 'preset' or 'random' "
+				f"(got {self.mazeGenerationMode!r})")
+		self.mazeGenerationMode = mode
+
+		if mode == 'random':
+			if force_random or self._activeMazeMode != 'random':
+				layout = generate_random_maze(
+					rows=self.mazeRows,
+					columns=self.mazeColumns,
+					base_cell=tuple(self.baseCell),
+					base_open_side=self.randomMazeBaseOpeningSide,
+					seed=self.randomMazeSeed,
+					maximum_attempts=self.randomMazeMaximumAttempts,
+				)
+				# Face the robot through the base's sole opening. This also keeps the
+				# navigation system's initial cardinal direction consistent with the maze.
+				self.baseYaw = {
+					'N': math.pi / 2.0,
+					'E': 0.0,
+					'S': -math.pi / 2.0,
+					'W': math.pi,
+				}[str(self.randomMazeBaseOpeningSide).upper()]
+				self._apply_maze_layout(layout)
+			return self.activeMazeLayout
+
+		# Restore the named preset only when changing back from random mode. On the first
+		# preset build, direct edits to the legacy active fields remain supported.
+		if self._activeMazeMode == 'random':
+			self.baseYaw = self.presetBaseYaw
+			wallSegments = self.presetMazeWallSegments
+			baseCell = self.presetBaseCell
+			victimCells = self.presetVictimCells
+		else:
+			wallSegments = self.mazeWallSegments
+			baseCell = self.baseCell
+			victimCells = self.victimCells
+		layout = MazeLayout(
+			rows=self.mazeRows,
+			columns=self.mazeColumns,
+			wall_segments=list(wallSegments),
+			base_cell=tuple(baseCell),
+			victim_cells=dict(victimCells),
+			mode='preset',
+		)
+		details = validate_maze_layout(layout)
+		layout.distances_from_base = details['distances_from_base']
+		layout.hazard_cells = details['hazard_cells']
+		self._apply_maze_layout(layout)
+		return layout
+
 	def validate_maze_parameters(self):
 		"""
 		Validate maze-related settings before any scene objects are created.
@@ -2409,63 +2573,28 @@ class SceneParameters(object):
 		if self.mazeRows <= 0 or self.mazeColumns <= 0:
 			raise ValueError(f"mazeRows and mazeColumns must be positive (got {self.mazeRows} x {self.mazeColumns})")
 
-		if self.mazeCellSize <= 0:
+		if not math.isfinite(self.mazeCellSize) or self.mazeCellSize <= 0:
 			raise ValueError(f"mazeCellSize must be positive (got {self.mazeCellSize})")
+		if not math.isfinite(self.baseYaw):
+			raise ValueError(f"baseYaw must be finite (got {self.baseYaw})")
 
-		maxColumnIndex = self.mazeColumns
-		maxRowIndex = self.mazeRows
-
-		for (startPoint, endPoint) in EXAMPLE_MAZE_SEGMENTS:
-			for point in (startPoint, endPoint):
-				column, row = point
-				if not (0 <= column <= maxColumnIndex):
-					raise ValueError(f"Wall endpoint column {column} out of range [0, {maxColumnIndex}]: {point}")
-				if not (0 <= row <= maxRowIndex):
-					raise ValueError(f"Wall endpoint row {row} out of range [0, {maxRowIndex}]: {point}")
-			if startPoint == endPoint:
-				raise ValueError(f"Wall segment has identical start and end point: {startPoint}")
-
-		maxCellColumnIndex = self.mazeColumns - 1
-		maxCellRowIndex = self.mazeRows - 1
-		axisAlignedWalls = {
-			tuple(sorted((tuple(startPoint), tuple(endPoint))))
-			for startPoint, endPoint in EXAMPLE_MAZE_SEGMENTS
-			if startPoint[0] == endPoint[0] or startPoint[1] == endPoint[1]
-		}
-		seenCells = set()
-		for label, cell in self.victimCells.items():
-			column, row = cell
-			if not (0 <= column <= maxCellColumnIndex):
-				raise ValueError(f"Victim '{label}' column {column} out of range [0, {maxCellColumnIndex}]")
-			if not (0 <= row <= maxCellRowIndex):
-				raise ValueError(f"Victim '{label}' row {row} out of range [0, {maxCellRowIndex}]")
-			if cell in seenCells:
-				raise ValueError(f"Victim cells must be unique - duplicate cell {cell}")
-			seenCells.add(cell)
-
-			cellSideSegments = {
-				'N': ((column, row), (column + 1, row)),
-				'E': ((column + 1, row), (column + 1, row + 1)),
-				'S': ((column, row + 1), (column + 1, row + 1)),
-				'W': ((column, row), (column, row + 1)),
-			}
-			boundarySides = {
-				'N': row == 0,
-				'E': column == maxCellColumnIndex,
-				'S': row == maxCellRowIndex,
-				'W': column == 0,
-			}
-			openSides = [
-				side for side, segment in cellSideSegments.items()
-				if not boundarySides[side] and tuple(sorted(segment)) not in axisAlignedWalls
-			]
-			if len(openSides) != 1:
-				raise ValueError(
-					f"Victim '{label}' at cell {cell} must be in a dead end with exactly "
-					f"one open side (found open sides: {openSides})")
-
-		if tuple(self.baseCell) in seenCells:
-			raise ValueError(f"baseCell {self.baseCell} must not coincide with a victim cell")
+		layout = MazeLayout(
+			rows=self.mazeRows,
+			columns=self.mazeColumns,
+			wall_segments=list(self.mazeWallSegments),
+			base_cell=tuple(self.baseCell),
+			victim_cells=dict(self.victimCells),
+			mode=str(self.mazeGenerationMode).strip().lower(),
+			seed=self.activeMazeSeed,
+			generation_attempt=self.mazeGenerationAttempt,
+		)
+		details = validate_maze_layout(layout)
+		layout.distances_from_base = details['distances_from_base']
+		layout.hazard_cells = details['hazard_cells']
+		self.mazeVictimDistances = dict(details['victim_distances'])
+		self.mazeHazardCells = list(details['hazard_cells'])
+		self.activeMazeLayout = layout
+		return details
 
 
 # Earlier class name retained so existing staff solutions continue to run.
