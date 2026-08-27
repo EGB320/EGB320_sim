@@ -17,8 +17,10 @@ from maze_generation import (
 	PRESET_BASE_YAW,
 	PRESET_MAZE_SEGMENTS,
 	PRESET_VICTIM_CELLS,
+	VICTIM_LEVELS,
 	generate_random_maze,
 	validate_maze_layout,
+	validate_victim_count,
 )
 
 
@@ -2212,7 +2214,9 @@ class MazeBot(object):
 			"Marker walls created: "
 			f"base={markerCounts['base']}, exposed victims={markerCounts['victim']}, "
 			f"trapped victims={markerCounts['rubble_victim']}, hazards={markerCounts['hazard']}")
-		print(f"Victims created: {victimCount}")
+		print(
+			f"Victims created: {victimCount} "
+			f"(configured: {self.sceneParameters.numberOfVictims})")
 		print(f"Maze source: {self.sceneParameters.mazeGenerationMode}")
 		if self.sceneParameters.activeMazeSeed is not None:
 			print(
@@ -2453,6 +2457,9 @@ class SceneParameters(object):
 		self.randomMazeSeed = None
 		self.randomMazeMaximumAttempts = 1000
 		self.randomMazeBaseOpeningSide = 'N'
+		# Generate the ordered prefix of victim levels: 1 -> L1, 2 -> L1/L2,
+		# 3 -> L1/L2/L3. Values outside the inclusive range 1--3 are rejected.
+		self.numberOfVictims = 3
 
 		# Public preset fields make switching from random back to the original maze
 		# explicit. mazeWallSegments/baseCell/victimCells below always describe the
@@ -2518,6 +2525,7 @@ class SceneParameters(object):
 				"mazeGenerationMode must be 'preset' or 'random' "
 				f"(got {self.mazeGenerationMode!r})")
 		self.mazeGenerationMode = mode
+		victimCount = validate_victim_count(self.numberOfVictims)
 
 		if mode == 'random':
 			if force_random or self._activeMazeMode != 'random':
@@ -2528,6 +2536,7 @@ class SceneParameters(object):
 					base_open_side=self.randomMazeBaseOpeningSide,
 					seed=self.randomMazeSeed,
 					maximum_attempts=self.randomMazeMaximumAttempts,
+					victim_count=victimCount,
 				)
 				# Face the robot through the base's sole opening. This also keeps the
 				# navigation system's initial cardinal direction consistent with the maze.
@@ -2546,11 +2555,21 @@ class SceneParameters(object):
 			self.baseYaw = self.presetBaseYaw
 			wallSegments = self.presetMazeWallSegments
 			baseCell = self.presetBaseCell
-			victimCells = self.presetVictimCells
 		else:
 			wallSegments = self.mazeWallSegments
 			baseCell = self.baseCell
-			victimCells = self.victimCells
+			# Keep legacy direct edits to victimCells as preset edits. Because this is an
+			# update rather than replacement, increasing the count later restores levels
+			# that were previously omitted from the active layout.
+			self.presetVictimCells.update({
+				label: tuple(cell)
+				for label, cell in self.victimCells.items()
+				if label in VICTIM_LEVELS
+			})
+		victimCells = {
+			label: self.presetVictimCells[label]
+			for label in VICTIM_LEVELS[:victimCount]
+		}
 		layout = MazeLayout(
 			rows=self.mazeRows,
 			columns=self.mazeColumns,
@@ -2577,6 +2596,12 @@ class SceneParameters(object):
 			raise ValueError(f"mazeCellSize must be positive (got {self.mazeCellSize})")
 		if not math.isfinite(self.baseYaw):
 			raise ValueError(f"baseYaw must be finite (got {self.baseYaw})")
+		victimCount = validate_victim_count(self.numberOfVictims)
+		expectedVictimLabels = set(VICTIM_LEVELS[:victimCount])
+		if set(self.victimCells) != expectedVictimLabels:
+			raise ValueError(
+				f"numberOfVictims={victimCount} requires victimCells labels "
+				f"{sorted(expectedVictimLabels)}; call prepare_maze_layout() before validation")
 
 		layout = MazeLayout(
 			rows=self.mazeRows,

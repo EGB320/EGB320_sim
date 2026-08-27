@@ -24,6 +24,7 @@ OPPOSITE_DIRECTION = {
 	'S': 'N',
 	'W': 'E',
 }
+VICTIM_LEVELS = ('L1', 'L2', 'L3')
 
 
 # The original hand-authored maze remains available as the default preset.  Wall
@@ -105,6 +106,14 @@ class MazeLayout:
 	generation_attempt: int = 1
 	distances_from_base: dict = field(default_factory=dict)
 	hazard_cells: list = field(default_factory=list)
+
+
+def validate_victim_count(victim_count):
+	"""Return a validated victim count in the supported inclusive range 1--3."""
+	if (not isinstance(victim_count, int) or isinstance(victim_count, bool) or
+			not 1 <= victim_count <= len(VICTIM_LEVELS)):
+		raise ValueError('number of victims must be an integer from 1 to 3')
+	return victim_count
 
 
 def normalise_grid_segment(start_point, end_point):
@@ -274,9 +283,10 @@ def _marker_assignments_for_dead_ends(rows, columns, wall_keys, adjacency):
 def validate_maze_layout(layout):
 	"""Validate challenge constraints and return useful derived topology details.
 
-	The three victim levels are compared by shortest-path distance from the base.  L1
-	must lie in the short portion of the route-distance range, L2 in the middle portion,
-	and L3 must be farther than both.  Every victim and the base must be a dead end.
+	Configured victim levels must be the ordered prefix L1, L1/L2, or L1/L2/L3. L1
+	must lie in the short portion of the route-distance range, L2 (when present) in the
+	middle portion, and L3 (when present) must be farther than both. Every generated
+	victim and the base must be a dead end.
 	"""
 	if layout.rows <= 0 or layout.columns <= 0:
 		raise ValueError(
@@ -287,18 +297,21 @@ def validate_maze_layout(layout):
 	base_cell = _validate_cell(
 		layout.base_cell, layout.rows, layout.columns, 'Base cell')
 
+	victim_count = validate_victim_count(len(layout.victim_cells))
+	configured_levels = VICTIM_LEVELS[:victim_count]
 	labels = set(layout.victim_cells)
-	expected_labels = {'L1', 'L2', 'L3'}
+	expected_labels = set(configured_levels)
 	if labels != expected_labels:
 		raise ValueError(
-			f"victim_cells must contain exactly L1, L2 and L3 (got {sorted(labels)})")
+			"victim_cells must contain an ordered level prefix: L1, L1/L2, or "
+			f"L1/L2/L3 (got {sorted(labels)})")
 
 	victim_cells = {}
-	for label in ('L1', 'L2', 'L3'):
+	for label in configured_levels:
 		victim_cells[label] = _validate_cell(
 			layout.victim_cells[label], layout.rows, layout.columns,
 			f"Victim '{label}' cell")
-	if len(set(victim_cells.values())) != 3:
+	if len(set(victim_cells.values())) != victim_count:
 		raise ValueError('Victim cells must be unique')
 	if base_cell in victim_cells.values():
 		raise ValueError(f"Base cell {base_cell} must not coincide with a victim cell")
@@ -324,27 +337,33 @@ def validate_maze_layout(layout):
 	victim_distances = {
 		label: distances[cell] for label, cell in victim_cells.items()
 	}
-	distance_l1 = victim_distances['L1']
-	distance_l2 = victim_distances['L2']
-	distance_l3 = victim_distances['L3']
-	if not distance_l1 < distance_l2 < distance_l3:
+	ordered_distances = [victim_distances[label] for label in configured_levels]
+	if any(
+			first >= second
+			for first, second in zip(ordered_distances, ordered_distances[1:])):
 		raise ValueError(
-			"Victim shortest-path distances must satisfy L1 < L2 < L3 "
+			"Victim shortest-path distances must increase with victim level "
 			f"(got {victim_distances})")
 
 	# These deliberately broad bands preserve the approved preset while preventing a
-	# random selection that calls three almost-equally-distant leaves short/medium/long.
-	short_upper = max(4, math.ceil(distance_l3 * 0.40))
-	medium_lower = max(distance_l1 + 1, math.floor(distance_l3 * 0.40))
-	medium_upper = max(medium_lower, math.ceil(distance_l3 * 0.80))
+	# random selection that calls almost-equally-distant leaves short/medium/long.
+	maximum_route_distance = max(distances.values())
+	distance_l1 = victim_distances['L1']
+	short_upper = max(4, math.ceil(maximum_route_distance * 0.40))
 	if distance_l1 > short_upper:
 		raise ValueError(
 			f"L1 victim is not in the short-distance band: distance {distance_l1}, "
 			f"maximum {short_upper}")
-	if not medium_lower <= distance_l2 <= medium_upper:
-		raise ValueError(
-			f"L2 victim is not in the medium-distance band: distance {distance_l2}, "
-			f"expected [{medium_lower}, {medium_upper}]")
+	if 'L2' in victim_distances:
+		distance_l2 = victim_distances['L2']
+		medium_lower = max(
+			distance_l1 + 1, math.floor(maximum_route_distance * 0.40))
+		medium_upper = max(
+			medium_lower, math.ceil(maximum_route_distance * 0.80))
+		if not medium_lower <= distance_l2 <= medium_upper:
+			raise ValueError(
+				f"L2 victim is not in the medium-distance band: distance {distance_l2}, "
+				f"expected [{medium_lower}, {medium_upper}]")
 
 	marker_sides = _marker_assignments_for_dead_ends(
 		layout.rows, layout.columns, wall_keys, adjacency)
@@ -363,14 +382,18 @@ def validate_maze_layout(layout):
 	}
 
 
-def create_preset_maze():
+def create_preset_maze(victim_count=3):
 	"""Return the original approved 7 x 7 maze as a :class:`MazeLayout`."""
+	victim_count = validate_victim_count(victim_count)
 	layout = MazeLayout(
 		rows=7,
 		columns=7,
 		wall_segments=list(PRESET_MAZE_SEGMENTS),
 		base_cell=PRESET_BASE_CELL,
-		victim_cells=dict(PRESET_VICTIM_CELLS),
+		victim_cells={
+			label: PRESET_VICTIM_CELLS[label]
+			for label in VICTIM_LEVELS[:victim_count]
+		},
 		mode='preset',
 		seed=None,
 	)
@@ -517,7 +540,8 @@ def _choose_victim_cells(adjacency, distances, base_cell, rng):
 
 def generate_random_maze(
 		rows=7, columns=7, base_cell=PRESET_BASE_CELL,
-		base_open_side='N', seed=None, maximum_attempts=1000):
+		base_open_side='N', seed=None, maximum_attempts=1000,
+		victim_count=3):
 	"""Generate a connected random challenge maze.
 
 	A randomized Kruskal spanning tree supplies the topology.  The base is removed while
@@ -527,6 +551,7 @@ def generate_random_maze(
 	"""
 	if not (isinstance(rows, int) and isinstance(columns, int)):
 		raise ValueError('Random maze rows and columns must be integers')
+	victim_count = validate_victim_count(victim_count)
 	if rows <= 1 or columns <= 1 or rows * columns < 8:
 		raise ValueError(
 			'Random challenge mazes require at least 8 cells and at least 2 rows/columns')
@@ -552,10 +577,14 @@ def generate_random_maze(
 		wall_keys = {normalise_grid_segment(*segment) for segment in wall_segments}
 		adjacency = build_open_adjacency(rows, columns, wall_keys)
 		distances = shortest_path_distances(adjacency, base_cell)
-		victim_cells = _choose_victim_cells(
+		all_victim_cells = _choose_victim_cells(
 			adjacency, distances, base_cell, rng)
-		if victim_cells is None:
+		if all_victim_cells is None:
 			continue
+		victim_cells = {
+			label: all_victim_cells[label]
+			for label in VICTIM_LEVELS[:victim_count]
+		}
 
 		layout = MazeLayout(
 			rows=rows,

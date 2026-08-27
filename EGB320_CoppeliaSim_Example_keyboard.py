@@ -11,7 +11,7 @@ import math
 import time
 
 from keyboard_control import KeyboardController, clear_console
-from mazebot_lib import MazeBot, RobotParameters
+from mazebot_lib import MazeBot, RobotParameters, SceneParameters
 
 
 FORWARD_SPEED = 0.03  # m/s
@@ -87,8 +87,15 @@ def main():
     # Choose 'legacy' (stable default) or 'opengl3' for the ObjectDetector renderer.
     parameters.objectDetectorRenderer = 'legacy'
 
-    # Connect to the supplied scene and generate the default maze.
-    robot = MazeBot(parameters)
+    # A small set of scene options students can safely change.
+    scene_parameters = SceneParameters()
+    scene_parameters.numberOfVictims = 1       # 1=L1, 2=L1/L2, 3=all victims
+    scene_parameters.mazeGenerationMode = 'random'  # 'preset' or 'random'
+    scene_parameters.randomMazeSeed = 1000      # integer = repeatable random maze
+    # scene_parameters.randomMazeSeed = None    # None = new maze each start
+
+    # Connect to the supplied scene and generate the configured maze.
+    robot = MazeBot(parameters, scene_parameters)
     keyboard = KeyboardController()
     robot.StartSimulator()
 

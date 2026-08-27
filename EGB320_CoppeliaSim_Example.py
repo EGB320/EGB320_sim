@@ -6,7 +6,7 @@ Press Ctrl+C in the terminal to stop.
 
 import time
 
-from mazebot_lib import MazeBot, RobotParameters
+from mazebot_lib import MazeBot, RobotParameters, SceneParameters
 
 
 FORWARD_SPEED = 0.08  # metres per second
@@ -18,7 +18,15 @@ def main():
     parameters = RobotParameters()
     # Choose 'legacy' (stable default) or 'opengl3' for the ObjectDetector renderer.
     parameters.objectDetectorRenderer = 'legacy'
-    robot = MazeBot(parameters)
+
+    # A small set of scene options students can safely change.
+    scene_parameters = SceneParameters()
+    scene_parameters.numberOfVictims = 3        # 1=L1, 2=L1/L2, 3=all victims
+    scene_parameters.mazeGenerationMode = 'random'  # 'preset' or 'random'
+    scene_parameters.randomMazeSeed = None      # None = new random maze each start
+    # scene_parameters.randomMazeSeed = 2026    # integer = repeatable random maze
+
+    robot = MazeBot(parameters, scene_parameters)
     robot.StartSimulator()
 
     try:

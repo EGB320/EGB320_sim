@@ -240,16 +240,26 @@ scene_parameters.robotStartingPosition = [0.0, 0.0, 0.0]
 robot = MazeBot(robot_parameters, scene_parameters)
 ```
 
-The default maze is 7 by 7 cells and contains three victim objects. Each victim is placed
+The default maze is 7 by 7 cells and contains three victim objects. The number can be
+set from 1 to 3; levels are included in order, so a value of 2 generates only L1 and L2:
+
+```python
+scene_parameters = SceneParameters()
+scene_parameters.numberOfVictims = 2
+```
+
+Each generated victim is placed
 in a dead end with its wall marker directly beyond it on the terminal wall, allowing an
 approaching robot to see both at once. Maze walls and victims are regenerated whenever
-`StartSimulator()` is called.
+`StartSimulator()` is called. A victim level omitted by `numberOfVictims` is no longer
+placed; if its cell remains a dead end, that cell receives a hazard marker instead.
 
 The original maze remains the default preset. To generate a challenge-compliant random
 maze at simulator start, select random mode before constructing `MazeBot`:
 
 ```python
 scene_parameters = SceneParameters()
+scene_parameters.numberOfVictims = 2             # L1 and L2 only (valid: 1-3)
 scene_parameters.mazeGenerationMode = 'random'  # or 'preset'
 scene_parameters.randomMazeSeed = None          # a fresh maze on every start
 # scene_parameters.randomMazeSeed = 2026         # repeatable for teaching/debugging
@@ -262,8 +272,9 @@ print(scene_parameters.activeMazeSeed)           # replay a generated maze later
 Random topology generation is implemented independently of CoppeliaSim in
 `maze_generation.py`. It creates a connected axis-aligned maze, forces the base to have
 one opening, and chooses one-entry victim cells using shortest-path distance from the
-base: L1 from the short band, L2 from the medium band and L3 as the farthest selected
-victim. The marker beyond each victim is placed on the wall opposite its only entrance.
+base: L1 from the short band, L2 from the medium band and, when configured, L3 as the
+farthest selected victim. The marker beyond each victim is placed on the wall opposite
+its only entrance.
 Every remaining one-entry cell receives a hazard marker. The accepted seed, victim path
 distances and hazard cells are printed when the scene is built and are also available as
 `activeMazeSeed`, `mazeVictimDistances` and `mazeHazardCells`.
@@ -342,12 +353,13 @@ navigation.set_goal_to_base()
 direction = navigation.choose_next_direction()
 ```
 
-`EGB320_CoppeliaSim_Example_floodfill.py` contains a conservative three-sortie rescue
-mission. It targets the configured Level 1 cell first. After delivering Level 1, it
+`EGB320_CoppeliaSim_Example_floodfill.py` contains a conservative configurable rescue
+mission for one to three victims. Set `VICTIMS_TO_RESCUE` near the top of that script.
+It targets the configured Level 1 cell first. After delivering Level 1, it
 flood-fills toward unvisited cells and diverts to victim cells inferred from camera
 range/bearing detections or close cyan/magenta victim markers. Every collected victim is
 returned to base before the next search begins; the robot backs into the base while facing
-its opening, then releases the three victims at separate lateral offsets. Its speed, turn
+its opening, then releases the configured victims at separate lateral offsets. Its speed, turn
 and safety constants are intentionally
 grouped near the top so they can be retuned if the drive geometry, physics engine or
 `driveSystemQuality` is changed. Before each transition it takes a median stopped range
