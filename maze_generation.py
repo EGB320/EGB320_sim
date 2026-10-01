@@ -101,6 +101,8 @@ class MazeLayout:
 	wall_segments: list
 	base_cell: tuple
 	victim_cells: dict
+	doorway_passage: tuple = None
+	rubble_floor_placements: list = field(default_factory=list)
 	mode: str = 'random'
 	seed: int = None
 	generation_attempt: int = 1
@@ -114,6 +116,15 @@ def validate_victim_count(victim_count):
 			not 1 <= victim_count <= len(VICTIM_LEVELS)):
 		raise ValueError('number of victims must be an integer from 1 to 3')
 	return victim_count
+
+
+def validate_rubble_floor_tile_count(rubble_floor_tile_count):
+	"""Return a validated rubble-floor count in the supported inclusive range 1--2."""
+	if (not isinstance(rubble_floor_tile_count, int) or
+			isinstance(rubble_floor_tile_count, bool) or
+			not 1 <= rubble_floor_tile_count <= 2):
+		raise ValueError('number of rubble floor tiles must be an integer from 1 to 2')
+	return rubble_floor_tile_count
 
 
 def normalise_grid_segment(start_point, end_point):
@@ -251,6 +262,127 @@ def shortest_path_distances(adjacency, start_cell):
 	return distances
 
 
+def _is_straight_corridor_cell(adjacency, cell):
+	"""Return whether ``cell`` has exactly two opposite open neighbours."""
+	neighbours = adjacency[cell]
+	if len(neighbours) != 2:
+		return False
+	first_delta = (
+		neighbours[0][0] - cell[0], neighbours[0][1] - cell[1])
+	second_delta = (
+		neighbours[1][0] - cell[0], neighbours[1][1] - cell[1])
+	return (
+		first_delta[0] + second_delta[0] == 0 and
+		first_delta[1] + second_delta[1] == 0)
+
+
+def find_straight_corridor_passages(adjacency):
+	"""Return open cell boundaries wholly inside straight corridor sections.
+
+	Both cells on a returned passage have exactly two opposite openings. A doorway on
+	their shared boundary is therefore perpendicular to travel and cannot close a mapped
+	maze edge.
+	"""
+	passages = []
+	for cell in sorted(adjacency):
+		if not _is_straight_corridor_cell(adjacency, cell):
+			continue
+		for neighbour in adjacency[cell]:
+			passage = tuple(sorted((cell, neighbour)))
+			if cell != passage[0]:
+				continue
+			if _is_straight_corridor_cell(adjacency, neighbour):
+				passages.append(passage)
+	return passages
+
+
+def passage_grid_segment(passage):
+	"""Return the grid-intersection segment shared by two adjacent cells."""
+	try:
+		first, second = (tuple(passage[0]), tuple(passage[1]))
+	except (TypeError, IndexError, ValueError):
+		raise ValueError('A doorway passage must contain two adjacent grid cells')
+	delta = (second[0] - first[0], second[1] - first[1])
+	if delta == (1, 0):
+		return cell_side_segment(first, 'E')
+	if delta == (-1, 0):
+		return cell_side_segment(first, 'W')
+	if delta == (0, 1):
+		return cell_side_segment(first, 'S')
+	if delta == (0, -1):
+		return cell_side_segment(first, 'N')
+	raise ValueError(
+		f'Doorway passage cells must share one cardinal edge (got {first} and {second})')
+
+
+def select_straight_corridor_passage(adjacency, rng=None):
+	"""Select one valid doorway passage, deterministically unless ``rng`` is supplied."""
+	candidates = find_straight_corridor_passages(adjacency)
+	if not candidates:
+		return None
+	return candidates[0] if rng is None else rng.choice(candidates)
+
+
+def select_rubble_floor_placements(
+		adjacency, rows, columns, base_cell, victim_cells,
+		rubble_floor_tile_count=1, rng=None, excluded_cells=()):
+	"""Choose traversable cells and closed sides for rubble-floor obstacles.
+
+	Each chosen cell is either a straight-through corridor or a junction, so it is
+	neither a victim/hazard dead end nor a corner that requires turning beside the
+	obstacle. Its rubble is assigned to a genuinely closed side of the cell, leaving
+	the open part available for navigation. Doorway cells can be supplied through
+	``excluded_cells`` to avoid combining two challenges at once.
+	"""
+	count = validate_rubble_floor_tile_count(rubble_floor_tile_count)
+	excluded = {
+		tuple(base_cell),
+		*(tuple(cell) for cell in victim_cells),
+		*(tuple(cell) for cell in excluded_cells),
+	}
+	candidates = []
+	for cell in sorted(adjacency, key=lambda value: (value[1], value[0])):
+		if (cell in excluded or len(adjacency[cell]) < 2 or
+				(len(adjacency[cell]) == 2 and
+				not _is_straight_corridor_cell(adjacency, cell))):
+			continue
+		open_neighbours = set(adjacency[cell])
+		closed_sides = []
+		for side in DIRECTIONS:
+			delta_column, delta_row = DIRECTION_DELTAS[side]
+			neighbour = (cell[0] + delta_column, cell[1] + delta_row)
+			if neighbour not in open_neighbours:
+				closed_sides.append(side)
+		if closed_sides:
+			candidates.append((cell, tuple(closed_sides)))
+
+	if len(candidates) < count:
+		return None
+
+	# Shuffle only after building a stable candidate order so seeded layouts remain
+	# reproducible across processes. Prefer spatially separated cells when two are used.
+	ordered = list(candidates)
+	if rng is not None:
+		rng.shuffle(ordered)
+	selected = [ordered.pop(0)]
+	while len(selected) < count:
+		selected_cells = {item[0] for item in selected}
+		non_adjacent = [
+			item for item in ordered
+			if all(item[0] not in adjacency[cell] for cell in selected_cells)
+		]
+		choice_pool = non_adjacent or ordered
+		choice = choice_pool[0] if rng is None else rng.choice(choice_pool)
+		selected.append(choice)
+		ordered.remove(choice)
+
+	placements = []
+	for cell, closed_sides in selected:
+		side = closed_sides[0] if rng is None else rng.choice(closed_sides)
+		placements.append((cell, side))
+	return placements
+
+
 def _open_side_for_dead_end(rows, columns, wall_keys, cell):
 	walls = get_cell_wall_sides(rows, columns, wall_keys, cell)
 	open_sides = [side for side in DIRECTIONS if not walls[side]]
@@ -328,6 +460,73 @@ def validate_maze_layout(layout):
 			f"Base cell {base_cell} must have exactly one entry/path "
 			f"(found {len(adjacency[base_cell])})")
 
+	doorway_segment = None
+	doorway_cells = set()
+	if layout.doorway_passage is not None:
+		try:
+			passageLength = len(layout.doorway_passage)
+		except TypeError:
+			raise ValueError('doorway_passage must contain exactly two grid cells')
+		if passageLength != 2:
+			raise ValueError('doorway_passage must contain exactly two grid cells')
+		try:
+			doorway_passage = tuple(sorted((
+				_validate_cell(
+					layout.doorway_passage[0], layout.rows, layout.columns,
+					'Doorway passage cell'),
+				_validate_cell(
+					layout.doorway_passage[1], layout.rows, layout.columns,
+					'Doorway passage cell'),
+			)))
+		except (TypeError, IndexError):
+			raise ValueError('doorway_passage must contain exactly two grid cells')
+		if doorway_passage not in find_straight_corridor_passages(adjacency):
+			raise ValueError(
+				f'Doorway passage {doorway_passage} must be an open boundary between '
+				'two straight-corridor cells')
+		doorway_segment = passage_grid_segment(doorway_passage)
+		doorway_cells = set(doorway_passage)
+
+	rubble_floor_placements = []
+	if layout.rubble_floor_placements:
+		validate_rubble_floor_tile_count(len(layout.rubble_floor_placements))
+		used_rubble_cells = set()
+		for placement_index, placement in enumerate(layout.rubble_floor_placements):
+			try:
+				cell, side = placement
+			except (TypeError, ValueError):
+				raise ValueError(
+					f'Rubble floor placement {placement_index} must be a (cell, wall side) pair')
+			cell = _validate_cell(
+				cell, layout.rows, layout.columns,
+				f'Rubble floor placement {placement_index} cell')
+			side = str(side).upper()
+			if side not in DIRECTIONS:
+				raise ValueError(
+					f'Rubble floor placement side must be one of {DIRECTIONS} (got {side!r})')
+			if cell in used_rubble_cells:
+				raise ValueError(f'Rubble floor tile cells must be unique (duplicate {cell})')
+			if cell == base_cell or cell in victim_cells.values():
+				raise ValueError(
+					f'Rubble floor tile cell {cell} must not be the base or a victim cell')
+			if cell in doorway_cells:
+				raise ValueError(
+					f'Rubble floor tile cell {cell} must not also contain the doorway')
+			if len(adjacency[cell]) < 2:
+				raise ValueError(
+					f'Rubble floor tile cell {cell} must have at least two open exits')
+			if (len(adjacency[cell]) == 2 and
+					not _is_straight_corridor_cell(adjacency, cell)):
+				raise ValueError(
+					f'Rubble floor tile cell {cell} must be a straight corridor or junction')
+			delta_column, delta_row = DIRECTION_DELTAS[side]
+			neighbour = (cell[0] + delta_column, cell[1] + delta_row)
+			if neighbour in adjacency[cell]:
+				raise ValueError(
+					f'Rubble floor tile at {cell} must face a closed wall side; {side} is open')
+			used_rubble_cells.add(cell)
+			rubble_floor_placements.append((cell, side))
+
 	for label, cell in victim_cells.items():
 		if len(adjacency[cell]) != 1:
 			raise ValueError(
@@ -379,12 +578,16 @@ def validate_maze_layout(layout):
 		'victim_distances': victim_distances,
 		'dead_end_marker_sides': marker_sides,
 		'hazard_cells': hazard_cells,
+		'doorway_segment': doorway_segment,
+		'rubble_floor_placements': rubble_floor_placements,
 	}
 
 
-def create_preset_maze(victim_count=3):
+def create_preset_maze(
+		victim_count=3, include_doorway=True, rubble_floor_tile_count=1):
 	"""Return the original approved 7 x 7 maze as a :class:`MazeLayout`."""
 	victim_count = validate_victim_count(victim_count)
+	rubble_floor_tile_count = validate_rubble_floor_tile_count(rubble_floor_tile_count)
 	layout = MazeLayout(
 		rows=7,
 		columns=7,
@@ -397,6 +600,25 @@ def create_preset_maze(victim_count=3):
 		mode='preset',
 		seed=None,
 	)
+	if include_doorway:
+		adjacency = build_open_adjacency(
+			layout.rows, layout.columns, layout.wall_segments)
+		layout.doorway_passage = select_straight_corridor_passage(adjacency)
+		if layout.doorway_passage is None:
+			raise ValueError('Preset maze has no suitable straight corridor for a doorway')
+	adjacency = build_open_adjacency(
+		layout.rows, layout.columns, layout.wall_segments)
+	layout.rubble_floor_placements = select_rubble_floor_placements(
+		adjacency,
+		layout.rows,
+		layout.columns,
+		layout.base_cell,
+		layout.victim_cells.values(),
+		rubble_floor_tile_count,
+		excluded_cells=layout.doorway_passage or (),
+	)
+	if layout.rubble_floor_placements is None:
+		raise ValueError('Preset maze has no suitable traversable cells for rubble floor tiles')
 	details = validate_maze_layout(layout)
 	layout.distances_from_base = details['distances_from_base']
 	layout.hazard_cells = details['hazard_cells']
@@ -541,7 +763,7 @@ def _choose_victim_cells(adjacency, distances, base_cell, rng):
 def generate_random_maze(
 		rows=7, columns=7, base_cell=PRESET_BASE_CELL,
 		base_open_side='N', seed=None, maximum_attempts=1000,
-		victim_count=3):
+		victim_count=3, include_doorway=True, rubble_floor_tile_count=1):
 	"""Generate a connected random challenge maze.
 
 	A randomized Kruskal spanning tree supplies the topology.  The base is removed while
@@ -552,6 +774,9 @@ def generate_random_maze(
 	if not (isinstance(rows, int) and isinstance(columns, int)):
 		raise ValueError('Random maze rows and columns must be integers')
 	victim_count = validate_victim_count(victim_count)
+	rubble_floor_tile_count = validate_rubble_floor_tile_count(rubble_floor_tile_count)
+	if not isinstance(include_doorway, bool):
+		raise ValueError('include_doorway must be True or False')
 	if rows <= 1 or columns <= 1 or rows * columns < 8:
 		raise ValueError(
 			'Random challenge mazes require at least 8 cells and at least 2 rows/columns')
@@ -585,6 +810,25 @@ def generate_random_maze(
 			label: all_victim_cells[label]
 			for label in VICTIM_LEVELS[:victim_count]
 		}
+		doorway_passage = None
+		if include_doorway:
+			doorway_passage = select_straight_corridor_passage(adjacency, rng)
+			if doorway_passage is None:
+				last_reason = 'no two-cell straight corridor was available for the doorway'
+				continue
+		rubble_floor_placements = select_rubble_floor_placements(
+			adjacency,
+			rows,
+			columns,
+			base_cell,
+			victim_cells.values(),
+			rubble_floor_tile_count,
+			rng,
+			doorway_passage or (),
+		)
+		if rubble_floor_placements is None:
+			last_reason = 'no suitable traversable cells were available for rubble floor tiles'
+			continue
 
 		layout = MazeLayout(
 			rows=rows,
@@ -592,6 +836,8 @@ def generate_random_maze(
 			wall_segments=wall_segments,
 			base_cell=base_cell,
 			victim_cells=victim_cells,
+			doorway_passage=doorway_passage,
+			rubble_floor_placements=rubble_floor_placements,
 			mode='random',
 			seed=actual_seed,
 			generation_attempt=attempt,

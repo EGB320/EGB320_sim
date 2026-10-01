@@ -5,3 +5,4 @@ EGB320_CoppeliaSim_Example_floodfill.py
 EGB320_CoppeliaSim_Example_navigation.py
 tests/test_mobility_feedback.py
 maze_navigation.py
+*.log

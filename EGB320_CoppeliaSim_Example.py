@@ -4,6 +4,7 @@ Open ``EGB320_search_and_rescue_2026.ttt`` in CoppeliaSim before running this fi
 Press Ctrl+C in the terminal to stop.
 """
 
+import math
 import time
 
 from mazebot_lib import MazeBot, RobotParameters, SceneParameters
@@ -18,13 +19,17 @@ def main():
     parameters = RobotParameters()
     # Choose 'legacy' (stable default) or 'opengl3' for the ObjectDetector renderer.
     parameters.objectDetectorRenderer = 'legacy'
+    parameters.objectDetectorPerspectiveAngle = math.radians(120.0)
+    parameters.objectDetectorResolutionX = 32
+    parameters.objectDetectorResolutionY = 32
 
     # A small set of scene options students can safely change.
     scene_parameters = SceneParameters()
     scene_parameters.numberOfVictims = 3        # 1=L1, 2=L1/L2, 3=all victims
+    scene_parameters.numberOfRubbleFloorTiles = 1  # valid: 1 or 2
     scene_parameters.mazeGenerationMode = 'random'  # 'preset' or 'random'
     scene_parameters.randomMazeSeed = None      # None = new random maze each start
-    # scene_parameters.randomMazeSeed = 2026    # integer = repeatable random maze
+    scene_parameters.generateDoorway = True
 
     robot = MazeBot(parameters, scene_parameters)
     robot.StartSimulator()
@@ -56,11 +61,15 @@ def main():
             # GetDetections() line until you need marker or victim detections.
             detections = None
             detections = robot.GetDetections()
+            # Red doorway sensing returns each visible inner edge independently as a
+            # metric [range, bearing] observation; a hidden edge is an empty list.
+            doorway_edges = robot.GetDoorwayEdges()
 
             print(f"wall distances: {walls}")
             print(f"DEBUG wheel encoders: {encoders}")
             print(f"DEBUG local odometry: {odometry}")
             print(f"visible objects: {detections}\n")
+            print(f"doorway inner edges: {doorway_edges}\n")
 
             # OPTIONAL: Read the full colour image from the VisionSensor camera.
             # This transfers much more data, so only call it when an image is needed.

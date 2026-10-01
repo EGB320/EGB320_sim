@@ -21,9 +21,12 @@ release victims.
    python EGB320_CoppeliaSim_Example_keyboard.py
    ```
 
-The keyboard example requires Windows. Its controls are W/A/S/D, Space to collect or
-release a victim, and Q to quit. The flood-fill example is a staff-only reference
-solution and is intentionally omitted from the student quick start.
+There are two keyboard examples: `EGB320_CoppeliaSim_Example_keyboard.py` requires
+Windows, and `EGB320_CoppeliaSim_Example_keyboard_pi.py` runs on Raspberry Pi/Linux
+(requires `pip install pynput` and a desktop session — see `keyboard_control_pi.py`).
+Both have the same controls: W/A/S/D, Space to collect or release a victim, and Q to
+quit. The flood-fill example is a staff-only reference solution and is intentionally
+omitted from the student quick start.
 
 ## Smallest useful program
 
@@ -148,7 +151,7 @@ are relative to the robot, not the maze.
 detections = robot.GetDetections()
 ```
 
-The result contains five separate object types:
+The result contains six separate object types:
 
 ```python
 {
@@ -157,6 +160,7 @@ The result contains five separate object types:
     'rubble_victim': [],
     'hazard': [],
     'victim_object': [],   # yellow victim on the ground
+    'rubble_obstacle': [], # orange obstacle attached to a rubble floor tile
 }
 ```
 
@@ -171,16 +175,23 @@ if yellow_victims:
 ```
 
 `GetDetectedVictims()` is also available when only the yellow victim is needed.
+`GetDetectedRubbleObstacles()` similarly returns only the closest visible orange rubble
+obstacle.
 
 #### ObjectDetector renderer
 
 The low-resolution colour detector can use either CoppeliaSim renderer:
 
 ```python
+import math
+
 from mazebot_lib import MazeBot, RobotParameters
 
 parameters = RobotParameters()
 parameters.objectDetectorRenderer = 'legacy'  # Stable default: Legacy OpenGL
+parameters.objectDetectorPerspectiveAngle = math.radians(120.0)  # Up to 135 degrees
+parameters.objectDetectorResolutionX = 32
+parameters.objectDetectorResolutionY = 32
 # parameters.objectDetectorRenderer = 'opengl3'  # Optional simOpenGL3 renderer
 
 robot = MazeBot(parameters)
@@ -190,6 +201,17 @@ Legacy OpenGL is recommended because the ObjectDetector only needs flat RGB colo
 OpenGL3 is available for comparison or systems where it is known to be stable, but its
 GPU-driver/plugin path may be less reliable on some computers. An unknown value raises a
 clear `ValueError` during robot initialization.
+
+`objectDetectorPerspectiveAngle` controls the field of view of the rendered low-resolution
+detector and its range/bearing visibility checks. It is specified in radians and can be set
+up to CoppeliaSim's 135-degree limit. The 120-degree default helps keep both red doorway
+posts visible as the robot approaches the opening; it does not change the full-resolution
+`VisionSensor` camera field of view.
+
+`objectDetectorResolutionX` and `objectDetectorResolutionY` independently configure the
+low-resolution detector and both default to 32 pixels. They do not change
+`cameraResolutionX` or `cameraResolutionY`, which belong to the full-resolution
+`VisionSensor` used by `GetCameraImage()`.
 
 ### Camera image
 
@@ -246,6 +268,7 @@ set from 1 to 3; levels are included in order, so a value of 2 generates only L1
 ```python
 scene_parameters = SceneParameters()
 scene_parameters.numberOfVictims = 2
+scene_parameters.numberOfRubbleFloorTiles = 1  # valid values are 1 or 2
 ```
 
 Each generated victim is placed
@@ -260,6 +283,7 @@ maze at simulator start, select random mode before constructing `MazeBot`:
 ```python
 scene_parameters = SceneParameters()
 scene_parameters.numberOfVictims = 2             # L1 and L2 only (valid: 1-3)
+scene_parameters.numberOfRubbleFloorTiles = 2    # valid: 1 or 2
 scene_parameters.mazeGenerationMode = 'random'  # or 'preset'
 scene_parameters.randomMazeSeed = None          # a fresh maze on every start
 # scene_parameters.randomMazeSeed = 2026         # repeatable for teaching/debugging
@@ -278,6 +302,69 @@ its only entrance.
 Every remaining one-entry cell receives a hazard marker. The accepted seed, victim path
 distances and hazard cells are printed when the scene is built and are also available as
 `activeMazeSeed`, `mazeVictimDistances` and `mazeHazardCells`.
+
+One or two `/rubble_floor_tile` copies are also placed during maze generation, controlled
+by `numberOfRubbleFloorTiles`. Placement excludes the base, victim cells, dead ends and
+the two doorway cells. Each selected cell is a straight-through corridor or junction,
+and the attached orange rubble is rotated against a closed wall side so the remaining
+space is navigable without requiring a turn beside the obstacle.
+The accepted topology is exposed as `rubbleFloorPlacements`, containing `(cell, side)`
+pairs such as `((2, 4), 'W')`.
+
+#### Milestone 2 demonstration mazes
+
+`EGB320_Milestone2_Mazes.py` contains two fixed, modest-difficulty demonstration mazes.
+Both start with a straight corridor and place L1 in a dead end after exactly two turns.
+Students keep their existing parameter objects and apply only the preset maze fields:
+
+```python
+from EGB320_Milestone2_Mazes import apply_milestone2_preset
+
+apply_milestone2_preset(scene_parameters, maze_number=1)  # 1 or 2
+```
+
+The helper does not create or replace `RobotParameters` or `SceneParameters`. Existing
+victim-count, cell-size, obstacle and robot settings are left unchanged. It explicitly
+disables doorway generation when used with a newer repository and does not import any
+doorway or maze-generation code, so the same handout file also works with older versions.
+
+### Doorway generation and inner-edge sensing
+
+When the scene contains the red `/Doorway` (or `/doorway`) template, one doorway is
+generated by default. Its location is selected only from an open boundary between two
+adjacent straight-corridor cells. The doorway is perpendicular to corridor travel and is
+not added to `mazeWallSegments`, so the map and flood-fill planner continue to treat the
+cell transition as open. The red side frame is physically respondable while its centre
+opening remains traversable.
+
+```python
+scene_parameters.generateDoorway = True
+scene_parameters.doorwayOpeningWidth = 0.20  # metres between the inner red edges
+```
+
+A monocular camera cannot determine absolute range from colour alone unless some physical
+geometry is known. `GetDoorwayEdges()` therefore uses the small RGB detector image to
+confirm that a red doorway is actually visible, then synthesises metric measurements to
+the generator's known inner-edge landmarks. This is the same camera-gated simulation
+pattern used for the coloured semantic markers, without exposing simulator-global poses.
+
+```python
+robot.UpdateObjectPositions()
+edges = robot.GetDoorwayEdges()
+
+if edges['left']:
+    left_range, left_bearing = edges['left']
+if edges['right']:
+    right_range, right_bearing = edges['right']
+```
+
+Ranges are metres from the camera. Bearings are radians relative to the camera, positive
+to the left. The two edges are independent: if one post leaves the field of view, the
+visible post can still have a measurement while the hidden side is an empty list. Both
+entries are empty when no doorway post is visible, the doorway is beyond the configured
+range, or the image does not produce enough red pixels.
+Students who are learning computer vision can instead use `GetCameraImage()` and perform
+their own red segmentation and camera calibration.
 
 The base station is itself a dead end. The robot begins facing a four-cell straight
 corridor whose first junction is at `(0, 2)`: continuing straight enters the wider maze,
@@ -422,6 +509,7 @@ when selecting optional obstacles or one particular detection class:
 from mazebot_lib import MazeObject
 
 obstacles = robot.GetDetectedObjects([MazeObject.obstacles])
+rubble = robot.GetDetectedObjects([MazeObject.rubbleObstacle])
 victim_markers = robot.GetDetectedObjects([MazeObject.victimMarker])
 yellow_victims = robot.GetDetectedObjects([MazeObject.victims])
 ```
@@ -431,9 +519,11 @@ yellow_victims = robot.GetDetectedObjects([MazeObject.victims])
 - `EGB320_search_and_rescue_2026.ttt`: CoppeliaSim scene.
 - `mazebot_lib.py`: Python robot library.
 - `EGB320_CoppeliaSim_Example.py`: minimal starting example.
-- `EGB320_CoppeliaSim_Example_keyboard.py`: manual driving and sensor demonstration.
+- `EGB320_CoppeliaSim_Example_keyboard.py`: manual driving and sensor demonstration (Windows).
+- `EGB320_CoppeliaSim_Example_keyboard_pi.py`: same demonstration for Raspberry Pi/Linux.
 - `EGB320_CoppeliaSim_Example_navigation.py`: known-route odometry/navigation example.
-- `keyboard_control.py`: keyboard helper used by the manual-driving example.
+- `keyboard_control.py`: keyboard helper used by the Windows manual-driving example.
+- `keyboard_control_pi.py`: keyboard helper used by the Raspberry Pi/Linux manual-driving example.
 
 Teacher-only solution files—do not include these in a student release:
 

@@ -8,8 +8,8 @@ sim = require('sim')
 function sysCall_vision(inData)
     -- Packet order (also used by mazeObjects in mazebot_lib.py):
     -- obstacle 0, obstacle 1, obstacle 2, base marker, victim marker,
-    -- rubble-victim marker, hazard marker, victim object.
-    local detections = {0, 0, 0, 0, 0, 0, 0, 0}
+    -- rubble-victim marker, hazard marker, victim object, orange rubble-floor obstacle.
+    local detections = {0, 0, 0, 0, 0, 0, 0, 0, 0}
 
     simVision.sensorImgToWorkImg(inData.handle)
     simVision.workImgToBuffer1(inData.handle)
@@ -42,7 +42,11 @@ function sysCall_vision(inData)
     -- Detector-only victim proxies are solid emissive yellow. A smaller blob limit is
     -- used because a victim occupies fewer pixels than a wall marker at the same range.
     detections[8] = detectColor(
-        {1.00, 1.00, 0.00}, {0.60, 0.60, 0.12}, 0.002) and 1 or 0
+        {1.00, 1.00, 0.00}, {0.60, 0.30, 0.12}, 0.002) and 1 or 0
+
+    -- The rubble child on each generated rubble_floor_tile is ambient orange.
+    detections[9] = detectColor(
+        {1.00, 0.50, 0.00}, {0.60, 0.35, 0.12}, 0.002) and 1 or 0
 
     -- Restore the original image. Adding buffer1 to the last binary mask caused the
     -- binary mask to clip and show false colours.

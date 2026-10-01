@@ -18,8 +18,13 @@ from maze_generation import (
 	PRESET_MAZE_SEGMENTS,
 	PRESET_VICTIM_CELLS,
 	VICTIM_LEVELS,
+	build_open_adjacency,
 	generate_random_maze,
+	passage_grid_segment,
+	select_rubble_floor_placements,
+	select_straight_corridor_passage,
 	validate_maze_layout,
+	validate_rubble_floor_tile_count,
 	validate_victim_count,
 )
 
@@ -44,6 +49,7 @@ MARKER_EMISSIVE_COLOURS = {
 	'hazard': (1.0, 0.0, 0.0),
 }
 VICTIM_DETECTOR_COLOUR = (1.0, 1.0, 0.0)
+RUBBLE_OBSTACLE_DETECTOR_COLOUR = (1.0, 0.5, 0.0)
 VISUAL_MARKER_COLOUR = (1.0, 1.0, 1.0)
 # Detector colour planes and the ObjectDetector sensor are not shown in the editor.
 # The robot's Lua script temporarily puts the detector planes on layer 1 only for
@@ -59,6 +65,8 @@ OBJECT_DETECTOR_RENDER_MODES = {
 	'legacy': ('Legacy OpenGL', 0),
 	'opengl3': ('OpenGL3', 7),
 }
+# CoppeliaSim clamps a perspective vision sensor to a maximum 135-degree angle.
+OBJECT_DETECTOR_MAX_PERSPECTIVE_ANGLE = math.radians(135.0)
 
 
 
@@ -70,13 +78,15 @@ class MazeObject(IntEnum):
 	obstacle1 = 1
 	obstacle2 = 2
 
-	# Search-and-rescue wall marker types. Values 0-6 match detector packet indices.
+	# Search-and-rescue types. Values 0-8 match detector packet indices.
 	baseStationMarker = 3
 	victimMarker = 4
 	rubbleVictimMarker = 5
 	hazardMarker = 6
 	victim = 7
 	victimObject = 7
+	rubbleObstacle = 8
+	rubbleFloorObstacle = 8
 
 	# Detection groups
 	obstacles = 100
@@ -155,6 +165,9 @@ class MazeBot(object):
 		self.victimWallTemplateHandle = None
 		self.rubbleVictimWallTemplateHandle = None
 		self.hazardWallTemplateHandle = None
+		self.doorwayTemplateHandle = None
+		self.rubbleFloorTileTemplateHandle = None
+		self.rubbleObstacleTemplateHandle = None
 		self.wallPostTemplateHandle = None
 		self.victimTemplateHandle = None
 
@@ -165,11 +178,17 @@ class MazeBot(object):
 		self.generatedVisualMarkerHandles = []
 		self.generatedDetectorMarkerHandles = []
 		self.generatedVictimDetectorHandles = []
+		self.generatedDoorwayHandles = []
+		self.generatedRubbleFloorTileHandles = []
+		self.rubbleFloorObstacleHandles = []
+		self.rubbleFloorObstaclePositions = []
 		self.victimDetectorHandles = {}
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
 		self.markerWallPlacements = []
+		self.doorwayPlacements = []
+		self.rubbleFloorPlacements = []
 		self.carriedVictimHandle = None
 		self.carriedVictimLabel = None
 		self.deliveredVictimLabels = set()
@@ -198,6 +217,8 @@ class MazeBot(object):
 		self.cameraPose = None
 		self.cameraForwardYaw = None
 		self.obstaclePositions = [None, None, None]
+		self.rubbleFloorObstaclePositions = [
+			None for _handle in self.rubbleFloorObstacleHandles]
 
 		# Local odometry is deliberately derived from wheel encoder counts, never from
 		# CoppeliaSim's global robot pose. The last counts form the integration baseline.
@@ -289,7 +310,7 @@ class MazeBot(object):
 		"""Helper function to process detection of a single object at a position"""
 		if position is not None and self._is_object_detected(objectsDetected, detection_index):
 			if self.PointInsideArena(position):
-				_valid, _range, _bearing = self.GetRBInCameraFOV(position)
+				_valid, _range, _bearing = self.GetRBInObjectDetectorFOV(position)
 				if _valid and _range < max_detection_distance:
 					return [_range, _bearing]
 		return None
@@ -306,7 +327,17 @@ class MazeBot(object):
 				'handleObjectDetector', self.scriptHandle)
 			if result == -1 or not packets:
 				return []
-			return list(packets)
+			packet = list(packets)
+			# Scenes made before rubble-floor support return the original eight-value
+			# packet. The Lua call leaves the detector's RGB render available, so append
+			# the orange flag in Python and keep those scenes immediately compatible.
+			if len(packet) == int(MazeObject.rubbleObstacle):
+				# The old yellow tolerance also admitted orange. Reclassify both colours
+				# from the preserved RGB frame so rubble cannot masquerade as a victim.
+				packet[int(MazeObject.victim)] = (
+					1 if self._yellow_victim_visible_in_detector_image() else 0)
+				packet.append(1 if self._orange_rubble_visible_in_detector_image() else 0)
+			return packet
 		except Exception as e:
 			print(f'Warning: ObjectDetector render failed: {e}')
 			return []
@@ -315,7 +346,7 @@ class MazeBot(object):
 		"""Convert one colour flag and known static marker position to range/bearing."""
 		if markerPosition is None or not self._is_object_detected(objectsDetected, detectionIndex):
 			return None
-		_valid, _range, _bearing = self.GetRBInCameraFOV(markerPosition)
+		_valid, _range, _bearing = self.GetRBInObjectDetectorFOV(markerPosition)
 		if _valid and _range < self.robotParameters.maxMarkerDetectionDistance:
 			return [_range, _bearing]
 		return None
@@ -336,9 +367,10 @@ class MazeBot(object):
 		requestedMarkerTypes = set(markerSelectorMap) if requestedMarkerTypes is None else set(requestedMarkerTypes)
 		markerDetections = {kind: [] for kind in markerSelectorMap.values()}
 
-		# Packet: [obstacle0, obstacle1, obstacle2, base marker, victim marker,
-		# rubble-victim marker, hazard marker, victim object].
-		if len(objectsDetected) != 8:
+		# Packet begins with [obstacle0, obstacle1, obstacle2, base marker, victim
+		# marker, rubble-victim marker, hazard marker, victim object]. Newer scripts
+		# append the orange rubble-floor obstacle flag.
+		if len(objectsDetected) < 8:
 			return markerDetections
 
 		for markerSelector, kind in markerSelectorMap.items():
@@ -366,7 +398,7 @@ class MazeBot(object):
 		
 		Args:
 			objects: List containing obstacle/victim/marker selectors or group selectors.
-				Defaults to all optional obstacles.
+				Defaults to all optional and generated rubble obstacles.
 			
 		Returns:
 			list: Requested detections as [range, bearing] pairs. Use GetDetections()
@@ -383,6 +415,8 @@ class MazeBot(object):
 			MazeObject.obstacle2,
 		)
 		detectAllObstacles = MazeObject.obstacles in requestedObjects
+		detectRubbleObstacle = (
+			detectAllObstacles or MazeObject.rubbleObstacle in requestedObjects)
 		markerSelectorMap = self._marker_selector_map()
 		detectAllMarkers = MazeObject.markers in requestedObjects
 		detectVictims = (
@@ -394,6 +428,7 @@ class MazeBot(object):
 		}
 		if (not detectAllObstacles and
 				not any(obstacle in requestedObjects for obstacle in obstacleTypes) and
+				not detectRubbleObstacle and
 				not requestedMarkerTypes and
 				not detectVictims):
 			return []
@@ -417,6 +452,9 @@ class MazeBot(object):
 						self.robotParameters.maxObstacleDetectionDistance)
 					if result is not None:
 						obstaclesRangeBearing.append(result)
+			if detectRubbleObstacle:
+				obstaclesRangeBearing.extend(
+					self._get_rubble_obstacle_detections_from_packet(objectsDetected))
 
 		markerDetections = self._get_marker_detections_from_packet(
 			objectsDetected, requestedMarkerTypes)
@@ -446,13 +484,36 @@ class MazeBot(object):
 				position = self.victimPositions.get(label)
 			if position is None:
 				continue
-			valid, rangeMetres, bearingRadians = self.GetRBInCameraFOV(position)
+			valid, rangeMetres, bearingRadians = self.GetRBInObjectDetectorFOV(position)
 			if valid and rangeMetres < self.robotParameters.maxVictimDetectionDistance:
 				candidates.append([rangeMetres, bearingRadians])
 
 		# The colour packet identifies the class rather than individual instances. Return
 		# only the closest geometrically valid victim to avoid reporting occluded victims.
 		return [min(candidates, key=lambda detection: detection[0])] if candidates else []
+
+	def _get_rubble_obstacle_detections_from_packet(self, objectsDetected):
+		"""Return the closest generated orange rubble obstacle visible to the detector."""
+		if not self._is_object_detected(
+				objectsDetected, int(MazeObject.rubbleObstacle)):
+			return []
+
+		candidates = []
+		for position in getattr(self, 'rubbleFloorObstaclePositions', ()):
+			if position is None:
+				continue
+			visible, rangeMetres, bearingRadians = self.GetRBInObjectDetectorFOV(position)
+			if (visible and
+					rangeMetres < self.robotParameters.maxObstacleDetectionDistance):
+				candidates.append([rangeMetres, bearingRadians])
+		return [min(candidates, key=lambda detection: detection[0])] if candidates else []
+
+	def GetDetectedRubbleObstacles(self):
+		"""Detect the closest visible orange rubble-floor obstacle."""
+		if self.cameraPose is None or self.objectDetectorHandle is None:
+			return []
+		return self._get_rubble_obstacle_detections_from_packet(
+			self._read_object_detector_packet())
 
 	def GetDetectedVictims(self):
 		"""
@@ -469,11 +530,12 @@ class MazeBot(object):
 
 	def GetDetections(self):
 		"""
-		Detect the four wall-marker types and yellow victim objects with one sensor update.
+		Detect wall markers, yellow victims and orange rubble with one sensor update.
 
 		Returns:
 			dict: Zero-or-one [range, bearing] pair under each of ``base``,
-				``victim``, ``rubble_victim``, ``hazard`` and ``victim_object``.
+				``victim``, ``rubble_victim``, ``hazard``, ``victim_object`` and
+				``rubble_obstacle``.
 				The ``victim`` key is the cyan victim marker on a wall, whereas
 				``victim_object`` is the separate yellow victim lying on the ground.
 				A list is empty when that type is not visible.
@@ -484,6 +546,7 @@ class MazeBot(object):
 			'rubble_victim': [],
 			'hazard': [],
 			'victim_object': [],
+			'rubble_obstacle': [],
 		}
 		if self.cameraPose is None or self.objectDetectorHandle is None:
 			return emptyResult
@@ -491,6 +554,8 @@ class MazeBot(object):
 		objectsDetected = self._read_object_detector_packet()
 		detections = self._get_marker_detections_from_packet(objectsDetected)
 		detections['victim_object'] = self._get_victim_detections_from_packet(
+			objectsDetected)
+		detections['rubble_obstacle'] = self._get_rubble_obstacle_detections_from_packet(
 			objectsDetected)
 		return detections
 
@@ -513,7 +578,7 @@ class MazeBot(object):
 	
 		try:
 			detectionCount, packet1, packet2 = self.sim.handleVisionSensor(self.cameraHandle)
-			image, resolution = self.sim.getVisionSensorImg(self.cameraHandle)
+			image, resolution = self.sim.getVisionSensorImg(self.cameraHandle, 0)
 			if image is not None:
 				image_data = self.sim.unpackUInt8Table(image)
 				return resolution, image_data
@@ -522,6 +587,273 @@ class MazeBot(object):
 		except Exception as e:
 			print(f"Error getting camera image: {e}")
 			return None, None
+
+	@staticmethod
+	def _count_red_camera_pixels(
+			resolution, imageData, minimumChannel=70, dominanceRatio=1.4):
+		"""Count red-dominant RGB pixels in a CoppeliaSim vision-sensor image."""
+		if not resolution or len(resolution) < 2 or imageData is None:
+			return 0
+		pixelCount = int(resolution[0]) * int(resolution[1])
+		if pixelCount <= 0:
+			return 0
+		channelCount = len(imageData) // pixelCount
+		if channelCount < 3:
+			return 0
+		redPixels = 0
+		for pixelIndex in range(pixelCount):
+			baseIndex = pixelIndex * channelCount
+			red = imageData[baseIndex]
+			green = imageData[baseIndex + 1]
+			blue = imageData[baseIndex + 2]
+			if (red >= minimumChannel and
+					red >= dominanceRatio * max(green, blue, 1)):
+				redPixels += 1
+		return redPixels
+
+	@staticmethod
+	def _count_orange_camera_pixels(
+			resolution, imageData, minimumRed=60, minimumGreen=20):
+		"""Count pixels whose chromaticity is consistent with orange rubble."""
+		if not resolution or len(resolution) < 2 or imageData is None:
+			return 0
+		pixelCount = int(resolution[0]) * int(resolution[1])
+		if pixelCount <= 0:
+			return 0
+		channelCount = len(imageData) // pixelCount
+		if channelCount < 3:
+			return 0
+		orangePixels = 0
+		for pixelIndex in range(pixelCount):
+			baseIndex = pixelIndex * channelCount
+			red = imageData[baseIndex]
+			green = imageData[baseIndex + 1]
+			blue = imageData[baseIndex + 2]
+			if (red >= minimumRed and green >= minimumGreen and
+					red >= 1.25 * green and green >= 1.35 * max(blue, 1)):
+				orangePixels += 1
+		return orangePixels
+
+	def _orange_rubble_visible_in_detector_image(self):
+		"""Read the last ObjectDetector RGB frame and gate it on orange pixels."""
+		try:
+			image, resolution = self.sim.getVisionSensorImg(
+				self.objectDetectorHandle, 0)
+			if image is None:
+				return False
+			imageData = self.sim.unpackUInt8Table(image)
+		except Exception:
+			return False
+		return self._count_orange_camera_pixels(
+			resolution, imageData,
+			self.robotParameters.rubbleOrangeMinimumRedChannel,
+			self.robotParameters.rubbleOrangeMinimumGreenChannel,
+		) >= self.robotParameters.rubbleMinimumOrangePixels
+
+	@staticmethod
+	def _count_yellow_camera_pixels(resolution, imageData, minimumChannel=60):
+		"""Count yellow pixels while rejecting the lower-green orange rubble colour."""
+		if not resolution or len(resolution) < 2 or imageData is None:
+			return 0
+		pixelCount = int(resolution[0]) * int(resolution[1])
+		if pixelCount <= 0:
+			return 0
+		channelCount = len(imageData) // pixelCount
+		if channelCount < 3:
+			return 0
+		yellowPixels = 0
+		for pixelIndex in range(pixelCount):
+			baseIndex = pixelIndex * channelCount
+			red = imageData[baseIndex]
+			green = imageData[baseIndex + 1]
+			blue = imageData[baseIndex + 2]
+			if (red >= minimumChannel and green >= minimumChannel and
+					0.75 <= green / max(red, 1) <= 1.25 and
+					blue <= 0.35 * min(red, green)):
+				yellowPixels += 1
+		return yellowPixels
+
+	def _yellow_victim_visible_in_detector_image(self):
+		"""Read the last ObjectDetector RGB frame and gate it on strict yellow."""
+		try:
+			image, resolution = self.sim.getVisionSensorImg(
+				self.objectDetectorHandle, 0)
+			if image is None:
+				return False
+			imageData = self.sim.unpackUInt8Table(image)
+		except Exception:
+			return False
+		return self._count_yellow_camera_pixels(
+			resolution, imageData) >= self.robotParameters.rubbleMinimumOrangePixels
+
+	@classmethod
+	def _red_doorway_post_groups(
+			cls, resolution, imageData, minimumPixels,
+			minimumChannel=70, dominanceRatio=1.4):
+		"""Return red vertical-column groups that can represent visible door posts."""
+		if cls._count_red_camera_pixels(
+				resolution, imageData, minimumChannel, dominanceRatio) < minimumPixels:
+			return []
+		width, height = int(resolution[0]), int(resolution[1])
+		pixelCount = width * height
+		channelCount = len(imageData) // pixelCount
+		columnCounts = [0] * width
+		for row in range(height):
+			for column in range(width):
+				baseIndex = (row * width + column) * channelCount
+				red = imageData[baseIndex]
+				green = imageData[baseIndex + 1]
+				blue = imageData[baseIndex + 2]
+				if (red >= minimumChannel and
+						red >= dominanceRatio * max(green, blue, 1)):
+					columnCounts[column] += 1
+		if not columnCounts or max(columnCounts) < 2:
+			return []
+		# Crossbars contribute only a small number of pixels to every interior column;
+		# the two vertical posts remain as two high-vote groups.
+		columnThreshold = max(2, math.ceil(max(columnCounts) * 0.5))
+		groups = []
+		groupStart = None
+		for column, count in enumerate(columnCounts + [0]):
+			if count >= columnThreshold and groupStart is None:
+				groupStart = column
+			elif count < columnThreshold and groupStart is not None:
+				groups.append((groupStart, column - 1))
+				groupStart = None
+		return groups
+
+	@classmethod
+	def _red_doorway_frame_visible(
+			cls, resolution, imageData, minimumPixels,
+			minimumChannel=70, dominanceRatio=1.4):
+		"""Retained compatibility helper for callers requiring the complete frame."""
+		return len(cls._red_doorway_post_groups(
+			resolution, imageData, minimumPixels,
+			minimumChannel, dominanceRatio)) >= 2
+
+	def _doorway_edge_detector_column(self, bearing, imageWidth):
+		"""Project a horizontal edge bearing into an ObjectDetector image column."""
+		halfFieldOfView = self.robotParameters.objectDetectorPerspectiveAngle / 2.0
+		normalisedOffset = math.tan(bearing) / math.tan(halfFieldOfView)
+		# Positive bearing is camera-left, which is the low-column side of the image.
+		return (imageWidth - 1) / 2.0 - normalisedOffset * imageWidth / 2.0
+
+	@staticmethod
+	def _column_distance_from_group(column, group):
+		"""Return the pixel distance from a projected column to a column interval."""
+		if column < group[0]:
+			return group[0] - column
+		if column > group[1]:
+			return column - group[1]
+		return 0.0
+
+	def _get_doorway_detection_image(self):
+		"""Render a small RGB detector image, falling back to the main camera."""
+		if getattr(self, 'objectDetectorHandle', None) is None:
+			return self.GetCameraImage()
+		try:
+			self.sim.handleVisionSensor(self.objectDetectorHandle)
+			image, resolution = self.sim.getVisionSensorImg(
+				self.objectDetectorHandle, 0)
+			if image is None:
+				return None, None
+			return resolution, self.sim.unpackUInt8Table(image)
+		except Exception:
+			return self.GetCameraImage()
+
+	def GetDoorwayEdges(self):
+		"""Measure the visible doorway's inner left and right red edges.
+
+		The RGB camera must contain a sufficiently large red doorway blob. Metric range
+		and bearing are then synthesised to the generator's known inner-edge landmarks,
+		matching the approach used by the existing coloured-marker detector while avoiding
+		exposing simulator-global poses to student code.
+
+		Returns:
+			dict: ``{'left': [range, bearing], 'right': [range, bearing]}``. Range is
+				in metres from the camera and bearing is in radians, positive to the left.
+				Each edge is reported independently; an edge is an empty list when that
+				side of the doorway is not visible.
+		"""
+		emptyResult = {'left': [], 'right': []}
+		if self.cameraPose is None or not getattr(self, 'doorwayPlacements', None):
+			return emptyResult
+
+		resolution, imageData = self._get_doorway_detection_image()
+		minimumPixels = self.robotParameters.doorwayMinimumRedPixels
+		postGroups = self._red_doorway_post_groups(
+			resolution,
+			imageData,
+			minimumPixels,
+			minimumChannel=self.robotParameters.doorwayRedMinimumChannel,
+			dominanceRatio=self.robotParameters.doorwayRedDominanceRatio,
+		)
+		if not postGroups:
+			return emptyResult
+
+		maximumRange = self.robotParameters.maxDoorwayDetectionDistance
+		visibleDoorways = []
+		for placement in self.doorwayPlacements:
+			edgeMeasurements = []
+			for edgePosition in placement['edgePositions']:
+				visible, edgeRange, bearing = self.GetRBInObjectDetectorFOV(edgePosition)
+				edgeMeasurements.append({
+					'measurement': [edgeRange, bearing],
+					'visible': visible and edgeRange <= maximumRange,
+					'column': self._doorway_edge_detector_column(
+						bearing, int(resolution[0])),
+				})
+
+			# Left/right are camera-relative and therefore follow descending bearing.
+			edgeMeasurements.sort(
+				key=lambda edge: edge['measurement'][1], reverse=True)
+			for label, edge in zip(('left', 'right'), edgeMeasurements):
+				edge['label'] = label
+			visibleEdges = [edge for edge in edgeMeasurements if edge['visible']]
+			if not visibleEdges:
+				continue
+
+			if len(postGroups) >= 2:
+				reportedEdges = visibleEdges
+			else:
+				# When only one post remains in the image, associate it with the closest
+				# projected inner edge. Reject an unresolved centre blob rather than
+				# guessing left or right.
+				group = postGroups[0]
+				rankedEdges = sorted(
+					visibleEdges,
+					key=lambda edge: self._column_distance_from_group(
+						edge['column'], group))
+				bestDistance = self._column_distance_from_group(
+					rankedEdges[0]['column'], group)
+				maximumPixelError = max(1.5, int(resolution[0]) * 0.10)
+				ambiguous = (
+					len(rankedEdges) > 1 and
+					abs(bestDistance - self._column_distance_from_group(
+						rankedEdges[1]['column'], group)) < 0.5)
+				reportedEdges = (
+					[] if bestDistance > maximumPixelError or ambiguous
+					else [rankedEdges[0]])
+
+			if reportedEdges:
+				visibleDoorways.append(reportedEdges)
+		if not visibleDoorways:
+			return emptyResult
+
+		# Only one doorway is generated, but choosing the closest keeps this API robust if
+		# more are added later.
+		reportedEdges = min(
+			visibleDoorways,
+			key=lambda edges: sum(
+				edge['measurement'][0] for edge in edges) / len(edges))
+		result = dict(emptyResult)
+		for edge in reportedEdges:
+			result[edge['label']] = edge['measurement']
+		return result
+
+	def GetDoorwayEdgeMeasurements(self):
+		"""Descriptive alias for :meth:`GetDoorwayEdges`."""
+		return self.GetDoorwayEdges()
 	
 	def GetWallDistances(self):
 		"""
@@ -1067,8 +1399,17 @@ class MazeBot(object):
 			['/rubble_victim_wall'], 'rubble_victim_wall template', required=True)
 		self.hazardWallTemplateHandle = self._resolve_first_available(
 			['/hazard_wall'], 'hazard_wall template', required=True)
+		self.doorwayTemplateHandle = self._resolve_first_available(
+			['/Doorway', '/doorway'], 'doorway template',
+			required=self.sceneParameters.generateDoorway)
+		self.rubbleFloorTileTemplateHandle = self._resolve_first_available(
+			['/rubble_floor_tile', '/RubbleFloorTile'],
+			'rubble_floor_tile template', required=True)
 		self.wallPostTemplateHandle = self._resolve_first_available(['/wall_post'], 'wall_post template', required=True)
 		self.victimTemplateHandle = self._resolve_first_available(['/victim'], 'victim template', required=True)
+		if self.rubbleFloorTileTemplateHandle is not None:
+			self.rubbleObstacleTemplateHandle = self._find_rubble_obstacle_child(
+				self.rubbleFloorTileTemplateHandle)
 		wallTemplateHandles = (
 			self.mazeWallTemplateHandle,
 			self.baseStationWallTemplateHandle,
@@ -1078,6 +1419,13 @@ class MazeBot(object):
 		)
 		if any(handle is None for handle in wallTemplateHandles) or self.wallPostTemplateHandle is None or self.victimTemplateHandle is None:
 			raise RuntimeError('One or more required maze template objects were not found.')
+		if self.sceneParameters.generateDoorway and self.doorwayTemplateHandle is None:
+			raise RuntimeError(
+				"generateDoorway is True, but no '/Doorway' or '/doorway' template exists")
+		if (self.rubbleFloorTileTemplateHandle is None or
+				self.rubbleObstacleTemplateHandle is None):
+			raise RuntimeError(
+				"The rubble floor template must contain a child shape named '/rubble'.")
 
 		# Colour only each child marker plane. The white structural wall remains unchanged.
 		self._configure_marker_template_planes()
@@ -1224,6 +1572,44 @@ class MazeBot(object):
 	# Updates the robot within COPPELIA based on the robot parameters
 	def UpdateCOPPELIARobot(self):
 		rendererDisplayName, rendererMode = self._get_object_detector_render_mode()
+		detectorPerspectiveAngle = self.robotParameters.objectDetectorPerspectiveAngle
+		if (isinstance(detectorPerspectiveAngle, bool) or
+				not isinstance(detectorPerspectiveAngle, (int, float)) or
+				not math.isfinite(detectorPerspectiveAngle) or
+				not 0.0 < detectorPerspectiveAngle <= OBJECT_DETECTOR_MAX_PERSPECTIVE_ANGLE):
+			raise ValueError(
+				'objectDetectorPerspectiveAngle must be greater than 0 and no more than '
+				'135 degrees (in radians)')
+		for parameterName in ('objectDetectorResolutionX', 'objectDetectorResolutionY'):
+			resolution = getattr(self.robotParameters, parameterName)
+			if (not isinstance(resolution, int) or isinstance(resolution, bool) or
+					resolution <= 0):
+				raise ValueError(f'{parameterName} must be a positive integer')
+		if (not math.isfinite(self.robotParameters.maxDoorwayDetectionDistance) or
+				self.robotParameters.maxDoorwayDetectionDistance <= 0.0):
+			raise ValueError('maxDoorwayDetectionDistance must be positive and finite')
+		if (not isinstance(self.robotParameters.doorwayMinimumRedPixels, int) or
+				isinstance(self.robotParameters.doorwayMinimumRedPixels, bool) or
+				self.robotParameters.doorwayMinimumRedPixels <= 0):
+			raise ValueError('doorwayMinimumRedPixels must be a positive integer')
+		if not 0 <= self.robotParameters.doorwayRedMinimumChannel <= 255:
+			raise ValueError('doorwayRedMinimumChannel must be in [0, 255]')
+		if (not math.isfinite(self.robotParameters.doorwayRedDominanceRatio) or
+				self.robotParameters.doorwayRedDominanceRatio <= 1.0):
+			raise ValueError('doorwayRedDominanceRatio must be finite and greater than 1')
+		if (not isinstance(self.robotParameters.rubbleMinimumOrangePixels, int) or
+				isinstance(self.robotParameters.rubbleMinimumOrangePixels, bool) or
+				self.robotParameters.rubbleMinimumOrangePixels <= 0):
+			raise ValueError('rubbleMinimumOrangePixels must be a positive integer')
+		for parameterName in (
+				'rubbleOrangeMinimumRedChannel',
+				'rubbleOrangeMinimumGreenChannel'):
+			channelValue = getattr(self.robotParameters, parameterName)
+			if (not isinstance(channelValue, (int, float)) or
+					isinstance(channelValue, bool) or
+					not math.isfinite(channelValue) or
+					not 0 <= channelValue <= 255):
+				raise ValueError(f'{parameterName} must be in [0, 255]')
 		self._configure_skid_steer_contact_geometry()
 
 		# Set Camera Pose and Orientation (skipped if no VisionSensor was resolved)
@@ -1241,13 +1627,29 @@ class MazeBot(object):
 					self.objectDetectorHandle,
 					self.sim.visionintparam_render_mode,
 					rendererMode)
+				self.sim.setObjectFloatParam(
+					self.objectDetectorHandle,
+					self.sim.visionfloatparam_perspective_angle,
+					detectorPerspectiveAngle)
+				self.sim.setObjectInt32Param(
+					self.objectDetectorHandle,
+					self.sim.visionintparam_resolution_x,
+					self.robotParameters.objectDetectorResolutionX)
+				self.sim.setObjectInt32Param(
+					self.objectDetectorHandle,
+					self.sim.visionintparam_resolution_y,
+					self.robotParameters.objectDetectorResolutionY)
 				self.sim.setObjectInt32Param(
 					self.objectDetectorHandle,
 					self.sim.objintparam_visibility_layer,
 					DETECTOR_MARKER_HIDDEN_LAYER)
-				print(f"ObjectDetector renderer: {rendererDisplayName}.")
+				print(
+					f"ObjectDetector renderer: {rendererDisplayName}; "
+					f"field of view: {math.degrees(detectorPerspectiveAngle):.1f} degrees; "
+					f"resolution: {self.robotParameters.objectDetectorResolutionX} x "
+					f"{self.robotParameters.objectDetectorResolutionY}.")
 			except Exception as e:
-				print(f"Warning: could not configure ObjectDetector render mode: {e}")
+				print(f"Warning: could not configure ObjectDetector: {e}")
 
 	def _configure_skid_steer_contact_geometry(self):
 		"""Place four-wheel contact axles for reliable centre-point turns.
@@ -1299,8 +1701,8 @@ class MazeBot(object):
 		Builds the static EGB320 search and rescue maze scene.
 
 		Validates the maze configuration, clears any previously generated maze objects,
-		then generates the wall posts, internal/perimeter walls and victims, and (optionally) places
-		the robot at its starting cell. Must be called while the simulation is stopped, since
+		then generates wall posts, walls, the open-passage doorway, rubble tiles and victims, and
+		(optionally) places the robot at its starting cell. Must be called while the simulation is stopped, since
 		it moves/scales/copies objects (this is done for us by StartSimulator).
 		"""
 		print('Preparing search and rescue maze scene...')
@@ -1327,11 +1729,15 @@ class MazeBot(object):
 		if self.sceneParameters.generateMazeObjects:
 			postCount = self._generate_wall_posts()
 			wallCount = self._generate_internal_walls()
+			doorwayCount = self._generate_doorway()
+			rubbleFloorTileCount = self._generate_rubble_floor_tiles()
 			victimCount = self._generate_victims()
 		else:
 			print('generateMazeObjects is False - leaving the table clear for diagnostics.')
 			postCount = 0
 			wallCount = 0
+			doorwayCount = 0
+			rubbleFloorTileCount = 0
 			victimCount = 0
 
 		self._park_templates_outside_playable_area()
@@ -1343,7 +1749,9 @@ class MazeBot(object):
 			self._place_robot_at_base()
 
 		self._log_table_wall_positions()
-		self._print_scene_summary(postCount, wallCount, victimCount, removedCount)
+		self._print_scene_summary(
+			postCount, wallCount, doorwayCount, rubbleFloorTileCount,
+			victimCount, removedCount)
 
 		self._set_obstacle_positions()
 
@@ -1509,6 +1917,8 @@ class MazeBot(object):
 			'rubble_victim_wall': self.rubbleVictimWallTemplateHandle,
 			'hazard_wall': self.hazardWallTemplateHandle,
 		}
+		if self.doorwayTemplateHandle is not None:
+			wallTemplates['doorway'] = self.doorwayTemplateHandle
 		self.wallTemplateGeometry = {
 			handle: self._get_wall_template_geometry(handle, name)
 			for name, handle in wallTemplates.items()
@@ -1551,6 +1961,22 @@ class MazeBot(object):
 		raise ValueError(
 			f"Marker-wall model handle {wallModelHandle} must contain exactly one "
 			f"child shape named '{childAlias}'.")
+
+	def _find_rubble_obstacle_child(self, tileHandle):
+		"""Return the single child shape named ``rubble`` beneath a floor tile."""
+		matches = []
+		for handle in self.sim.getObjectsInTree(
+				tileHandle, self.sim.sceneobject_shape, 0):
+			if handle == tileHandle:
+				continue
+			alias = self.sim.getObjectAlias(handle, 0)
+			if str(alias).lower() == 'rubble':
+				matches.append(handle)
+		if len(matches) != 1:
+			raise ValueError(
+				"The /rubble_floor_tile template must contain exactly one child "
+				"shape named 'rubble'.")
+		return matches[0]
 
 	def _find_marker_plane(self, wallModelHandle):
 		"""Return the textured visual marker child."""
@@ -1974,6 +2400,206 @@ class MazeBot(object):
 				f"on side {marker['side']} ({marker['alias']})")
 		return count
 
+	def _generate_doorway(self):
+		"""Place one doorway across an open boundary in a straight corridor."""
+		self.doorwayPlacements = []
+		if (not self.sceneParameters.generateDoorway or
+				self.sceneParameters.doorwayPassage is None):
+			return 0
+		if self.doorwayTemplateHandle is None:
+			raise RuntimeError('Doorway generation requested, but no doorway template was resolved')
+
+		startPoint, endPoint = self.sceneParameters.doorwaySegment
+		x1, y1 = self._grid_point_to_world(*startPoint)
+		x2, y2 = self._grid_point_to_world(*endPoint)
+		dx = x2 - x1
+		dy = y2 - y1
+		length = math.hypot(dx, dy)
+		if length < 1e-9:
+			raise ValueError('Configured doorway segment has zero length')
+
+		geometry = self.wallTemplateGeometry[self.doorwayTemplateHandle]
+		scaleFactor = length / geometry['size'][geometry['lengthAxisIndex']]
+		newHandle = self._copy_and_scale_wall_template(
+			self.doorwayTemplateHandle, geometry, scaleFactor)
+		segmentYaw = math.atan2(dy, dx)
+		midX = (x1 + x2) / 2.0
+		midY = (y1 + y2) / 2.0
+
+		# Preserve the template's authored upright rotation, adding only the grid yaw.
+		helperDummy = self.sim.createDummy(0.01)
+		self.sim.setObjectPosition(helperDummy, -1, [midX, midY, 0.0])
+		self.sim.setObjectOrientation(
+			helperDummy, -1, [0.0, 0.0, segmentYaw - geometry['lengthAxisBaseYaw']])
+		self.sim.setObjectPosition(newHandle, helperDummy, [0.0, 0.0, 0.0])
+		self.sim.setObjectOrientation(
+			newHandle, helperDummy, list(geometry['orientation']))
+		self.sim.removeObject(helperDummy)
+
+		# The imported doorway's shape origin is deliberately not at its bounding-box
+		# centre. Align the actual scaled mesh, not its origin, with the grid segment and
+		# rest its lowest point on the floor.
+		shapeMatrix = self.sim.getObjectMatrix(newHandle, -1)
+		bboxPoints = [
+			self._transform_point(shapeMatrix, point)
+			for point in self._get_shape_bbox_points(newHandle)
+		]
+		bboxCenterX = 0.5 * (
+			min(point[0] for point in bboxPoints) + max(point[0] for point in bboxPoints))
+		bboxCenterY = 0.5 * (
+			min(point[1] for point in bboxPoints) + max(point[1] for point in bboxPoints))
+		bboxMinimumZ = min(point[2] for point in bboxPoints)
+		position = self.sim.getObjectPosition(newHandle, -1)
+		self.sim.setObjectPosition(newHandle, -1, [
+			position[0] + midX - bboxCenterX,
+			position[1] + midY - bboxCenterY,
+			position[2] + self.floorTopZ - bboxMinimumZ,
+		])
+
+		# The doorway frame is a static collision/detection object, but its centre opening
+		# remains physically clear. It is not included in mazeWallSegments, so mapping and
+		# flood-fill continue to treat this shared edge as open.
+		for shapeHandle in self.sim.getObjectsInTree(
+				newHandle, self.sim.object_shape_type, 0):
+			self.sim.setObjectInt32Param(
+				shapeHandle, self.sim.shapeintparam_static, 1)
+			self.sim.setObjectInt32Param(
+				shapeHandle, self.sim.shapeintparam_respondable, 1)
+
+		alias = 'EGB320_GEN_DOORWAY'
+		self.sim.setObjectAlias(newHandle, alias)
+		self.sim.setObjectParent(newHandle, self.generatedSceneRootHandle, True)
+		self.generatedDoorwayHandles.append(newHandle)
+
+		unitX, unitY = dx / length, dy / length
+		halfOpening = self.sceneParameters.doorwayOpeningWidth / 2.0
+		edgePositions = [
+			[midX - halfOpening * unitX, midY - halfOpening * unitY, self.floorTopZ],
+			[midX + halfOpening * unitX, midY + halfOpening * unitY, self.floorTopZ],
+		]
+		placement = {
+			'handle': newHandle,
+			'alias': alias,
+			'passage': tuple(self.sceneParameters.doorwayPassage),
+			'segment': (tuple(startPoint), tuple(endPoint)),
+			'center': [midX, midY, self.floorTopZ],
+			'edgePositions': edgePositions,
+		}
+		self.doorwayPlacements.append(placement)
+		print(
+			f"Doorway: passage {placement['passage']} across open segment "
+			f"{placement['segment']} ({self.sceneParameters.doorwayOpeningWidth:.3f} m opening)")
+		return 1
+
+	def _generate_rubble_floor_tiles(self):
+		"""Copy rubble-floor tiles into topology-approved cells against closed walls."""
+		self.generatedRubbleFloorTileHandles = []
+		self.rubbleFloorObstacleHandles = []
+		self.rubbleFloorObstaclePositions = []
+		self.rubbleFloorPlacements = []
+		if not self.sceneParameters.rubbleFloorPlacements:
+			return 0
+		if (self.rubbleFloorTileTemplateHandle is None or
+				self.rubbleObstacleTemplateHandle is None):
+			raise RuntimeError('Rubble-floor generation requested without a valid template')
+
+		sourceHandles = self.sim.getObjectsInTree(
+			self.rubbleFloorTileTemplateHandle, self.sim.handle_all, 0)
+		tileTemplateOrientation = self.sim.getObjectOrientation(
+			self.rubbleFloorTileTemplateHandle, -1)
+		try:
+			obstacleSourceIndex = sourceHandles.index(self.rubbleObstacleTemplateHandle)
+		except ValueError as error:
+			raise RuntimeError(
+				"The 'rubble' shape is not inside the rubble_floor_tile hierarchy") from error
+
+		# The source shape is already authored flat through its bounding-box pose. Its
+		# rubble edge points south at zero added yaw; the instructor-corrected north-wall
+		# references therefore use a 180-degree yaw and no extra pitch/roll.
+		wallSideYaw = {
+			'S': 0.0,
+			'E': math.pi / 2.0,
+			'N': math.pi,
+			'W': -math.pi / 2.0,
+		}
+		for index, (configuredCell, configuredSide) in enumerate(
+				self.sceneParameters.rubbleFloorPlacements):
+			cell = tuple(configuredCell)
+			side = str(configuredSide).upper()
+			copiedHandles = self.sim.copyPasteObjects(sourceHandles, 0)
+			if not copiedHandles or len(copiedHandles) != len(sourceHandles):
+				raise RuntimeError(
+					'Could not copy the complete rubble_floor_tile hierarchy')
+			tileHandle = copiedHandles[0]
+			rubbleHandle = copiedHandles[obstacleSourceIndex]
+			x, y = self._cell_center_to_world(*cell)
+
+			helperDummy = self.sim.createDummy(0.01)
+			self.sim.setObjectPosition(helperDummy, -1, [x, y, self.floorTopZ])
+			self.sim.setObjectOrientation(
+				helperDummy, -1, [0.0, 0.0, wallSideYaw[side]])
+			self.sim.setObjectPosition(tileHandle, helperDummy, [0.0, 0.0, 0.0])
+			self.sim.setObjectOrientation(
+				tileHandle, helperDummy, list(tileTemplateOrientation))
+			self.sim.removeObject(helperDummy)
+
+			# The template origin is offset from the 0.28 m tile centre. Centre the actual
+			# mesh in the selected cell and align its lowest surface just above the floor;
+			# otherwise rotating it changes both its apparent cell and rubble-wall offset.
+			tileMatrix = self.sim.getObjectMatrix(tileHandle, -1)
+			bboxPoints = [
+				self._transform_point(tileMatrix, point)
+				for point in self._get_shape_bbox_points(tileHandle)
+			]
+			bboxCenterX = 0.5 * (
+				min(point[0] for point in bboxPoints) +
+				max(point[0] for point in bboxPoints))
+			bboxCenterY = 0.5 * (
+				min(point[1] for point in bboxPoints) +
+				max(point[1] for point in bboxPoints))
+			minimumZ = min(point[2] for point in bboxPoints)
+			position = self.sim.getObjectPosition(tileHandle, -1)
+			self.sim.setObjectPosition(tileHandle, -1, [
+				position[0] + x - bboxCenterX,
+				position[1] + y - bboxCenterY,
+				position[2] + self.floorTopZ + 0.0002 - minimumZ,
+			])
+
+			for shapeHandle in self.sim.getObjectsInTree(
+					tileHandle, self.sim.object_shape_type, 0):
+				self.sim.setObjectInt32Param(
+					shapeHandle, self.sim.shapeintparam_static, 1)
+				self.sim.setObjectInt32Param(
+					shapeHandle, self.sim.shapeintparam_respondable,
+					1 if shapeHandle == rubbleHandle else 0)
+			# Reassert the authored orange on generated rubble copies. Keeping this as an
+			# ambient/diffuse colour makes it available to the RGB ObjectDetector.
+			self.sim.setShapeColor(
+				rubbleHandle, None, self.sim.colorcomponent_ambient_diffuse,
+				list(RUBBLE_OBSTACLE_DETECTOR_COLOUR))
+
+			alias = f'EGB320_GEN_RUBBLE_FLOOR_TILE_{index:02d}'
+			self.sim.setObjectAlias(tileHandle, alias)
+			self.sim.setObjectParent(
+				tileHandle, self.generatedSceneRootHandle, True)
+			rubblePosition = self.sim.getObjectPosition(rubbleHandle, -1)
+			placement = {
+				'handle': tileHandle,
+				'obstacleHandle': rubbleHandle,
+				'alias': alias,
+				'cell': cell,
+				'wallSide': side,
+				'position': list(rubblePosition),
+			}
+			self.generatedRubbleFloorTileHandles.append(tileHandle)
+			self.rubbleFloorObstacleHandles.append(rubbleHandle)
+			self.rubbleFloorObstaclePositions.append(list(rubblePosition))
+			self.rubbleFloorPlacements.append(placement)
+			print(
+				f"Rubble floor tile: cell {cell}, obstacle against {side} wall "
+				f"({alias})")
+		return len(self.generatedRubbleFloorTileHandles)
+
 	def _generate_victims(self):
 		"""Create one /victim copy at each configured victim cell centre."""
 		victimMinimumZ, _ = self._get_oriented_shape_z_extent(
@@ -2051,6 +2677,10 @@ class MazeBot(object):
 			self.wallPostTemplateHandle: (-3.4, -3.0),
 			self.victimTemplateHandle: (-3.4, -3.4),
 		}
+		if self.doorwayTemplateHandle is not None:
+			parkingSpots[self.doorwayTemplateHandle] = (-3.4, -3.8)
+		if self.rubbleFloorTileTemplateHandle is not None:
+			parkingSpots[self.rubbleFloorTileTemplateHandle] = (-3.4, -4.2)
 		for handle, (parkX, parkY) in parkingSpots.items():
 			try:
 				currentPosition = self.sim.getObjectPosition(handle, -1)
@@ -2182,11 +2812,17 @@ class MazeBot(object):
 		self.generatedVisualMarkerHandles = []
 		self.generatedDetectorMarkerHandles = []
 		self.generatedVictimDetectorHandles = []
+		self.generatedDoorwayHandles = []
+		self.generatedRubbleFloorTileHandles = []
+		self.rubbleFloorObstacleHandles = []
+		self.rubbleFloorObstaclePositions = []
 		self.victimDetectorHandles = {}
 		self.generatedWallPostHandles = []
 		self.victimHandles = {}
 		self.victimPositions = {}
 		self.markerWallPlacements = []
+		self.doorwayPlacements = []
+		self.rubbleFloorPlacements = []
 		self.carriedVictimHandle = None
 		self.carriedVictimLabel = None
 		self.deliveredVictimLabels = set()
@@ -2194,7 +2830,9 @@ class MazeBot(object):
 		print(f"Cleanup removed {removedCount} previously generated object(s).")
 		return removedCount
 
-	def _print_scene_summary(self, postCount, wallCount, victimCount, removedCount):
+	def _print_scene_summary(
+			self, postCount, wallCount, doorwayCount, rubbleFloorTileCount,
+			victimCount, removedCount):
 		"""Print a concise summary of the generated search and rescue scene."""
 		mazeWidth = self.sceneParameters.mazeColumns * self.sceneParameters.mazeCellSize
 		mazeHeight = self.sceneParameters.mazeRows * self.sceneParameters.mazeCellSize
@@ -2206,6 +2844,8 @@ class MazeBot(object):
 		print(f"Maze footprint: {mazeWidth:.3f} m x {mazeHeight:.3f} m")
 		print(f"Posts created: {postCount}")
 		print(f"Walls created: {wallCount}")
+		print(f"Doorways created across open passages: {doorwayCount}")
+		print(f"Rubble floor tiles created: {rubbleFloorTileCount}")
 		markerCounts = {
 			kind: sum(1 for marker in self.markerWallPlacements if marker['kind'] == kind)
 			for kind in ('base', 'victim', 'rubble_victim', 'hazard')
@@ -2347,6 +2987,8 @@ class MazeBot(object):
 		self.cameraPose = None
 		self.cameraForwardYaw = None
 		self.obstaclePositions = [None, None, None]
+		self.rubbleFloorObstaclePositions = [
+			None for _handle in self.rubbleFloorObstacleHandles]
 
 		# GET 3D CAMERA POSE
 		if self.cameraHandle is not None:
@@ -2372,13 +3014,30 @@ class MazeBot(object):
 			except Exception as e:
 				print(f"Error getting obstacle position {index}: {e}")
 
-	def GetRBInCameraFOV(self, objectPosition):
+		# Generated rubble obstacles are static, but refreshing them here keeps the
+		# public detection path consistent if an instructor moves one in CoppeliaSim.
+		for index, rubbleHandle in enumerate(self.rubbleFloorObstacleHandles):
+			try:
+				self.rubbleFloorObstaclePositions[index] = self.sim.getObjectPosition(
+					rubbleHandle, -1)
+			except Exception as e:
+				print(f"Error getting rubble obstacle position {index}: {e}")
+
+	def GetRBInCameraFOV(self, objectPosition, perspectiveAngle=None):
 		"""Return ``(visible, range, bearing)`` for a world point relative to the camera."""
 		cameraYaw = self.cameraForwardYaw if self.cameraForwardYaw is not None else self.cameraPose[5]
 		cameraPose2d = [self.cameraPose[0], self.cameraPose[1], cameraYaw]
 		_range, _bearing = self.GetRangeAndBearingFromPoseAndPoint(cameraPose2d, objectPosition)
-		_valid = abs(_bearing) < self.robotParameters.cameraPerspectiveAngle / 2
+		if perspectiveAngle is None:
+			perspectiveAngle = self.robotParameters.cameraPerspectiveAngle
+		_valid = abs(_bearing) < perspectiveAngle / 2
 		return _valid, _range, _bearing
+
+	def GetRBInObjectDetectorFOV(self, objectPosition):
+		"""Apply the ObjectDetector's configured field of view to a world point."""
+		return self.GetRBInCameraFOV(
+			objectPosition,
+			self.robotParameters.objectDetectorPerspectiveAngle)
 			
 	
 	# Determines if a 2D point is inside the arena, returns true if that is the case
@@ -2427,11 +3086,27 @@ class RobotParameters(object):
 		# Low-resolution colour detector renderer. 'legacy' is the stable default;
 		# 'opengl3' opts into CoppeliaSim's optional simOpenGL3 plugin renderer.
 		self.objectDetectorRenderer = 'legacy'
+		# The detector is square, so this is its horizontal and vertical perspective
+		# angle. A wider 120-degree view keeps both doorway posts visible at close range.
+		self.objectDetectorPerspectiveAngle = math.radians(120.0)
+		self.objectDetectorResolutionX = 32
+		self.objectDetectorResolutionY = 32
 		
 		# Detection Parameters
 		self.maxObstacleDetectionDistance = 1.5  # max distance to detect obstacles in m
 		self.maxMarkerDetectionDistance = 1.5    # max distance to detect wall markers in m
 		self.maxVictimDetectionDistance = 1.5    # max distance to detect victim objects in m
+		self.maxDoorwayDetectionDistance = 1.5   # max camera-to-door-edge range in m
+		# ObjectDetector red segmentation gates GetDoorwayEdges(). Metric range/bearing then
+		# comes from the known generated edge landmarks, as for other semantic detections.
+		self.doorwayMinimumRedPixels = 3
+		self.doorwayRedMinimumChannel = 70
+		self.doorwayRedDominanceRatio = 1.4
+		# Used as a compatibility fallback with scenes whose embedded Lua detector still
+		# returns the original eight-value packet. New scripts detect the same orange in Lua.
+		self.rubbleMinimumOrangePixels = 2
+		self.rubbleOrangeMinimumRedChannel = 60
+		self.rubbleOrangeMinimumGreenChannel = 20
 		
 		# Victim collection parameter from the 2026 assessment rules
 		self.victimCollectionDistance = 0.10  # shortest horizontal clearance in metres
@@ -2460,6 +3135,13 @@ class SceneParameters(object):
 		# Generate the ordered prefix of victim levels: 1 -> L1, 2 -> L1/L2,
 		# 3 -> L1/L2/L3. Values outside the inclusive range 1--3 are rejected.
 		self.numberOfVictims = 3
+		# Place one or two obstacle-bearing floor tiles. Each obstacle is oriented
+		# against a closed wall in a cell with at least two exits.
+		self.numberOfRubbleFloorTiles = 1
+		# A doorway is generated across an open boundary between two straight-corridor
+		# cells. It is a traversable frame, never an entry in mazeWallSegments.
+		self.generateDoorway = True
+		self.doorwayOpeningWidth = 0.200  # inner red-edge separation in metres
 
 		# Public preset fields make switching from random back to the original maze
 		# explicit. mazeWallSegments/baseCell/victimCells below always describe the
@@ -2478,6 +3160,18 @@ class SceneParameters(object):
 		self.mazeGenerationAttempt = 1
 		self.mazeVictimDistances = {}
 		self.mazeHazardCells = []
+		self.doorwayPassage = None
+		self.doorwaySegment = None
+		initialAdjacency = build_open_adjacency(
+			self.mazeRows, self.mazeColumns, self.mazeWallSegments)
+		self.rubbleFloorPlacements = select_rubble_floor_placements(
+			initialAdjacency,
+			self.mazeRows,
+			self.mazeColumns,
+			self.baseCell,
+			self.victimCells.values(),
+			self.numberOfRubbleFloorTiles,
+		)
 		self.activeMazeLayout = None
 		self._activeMazeMode = 'preset'
 		self.placeRobotAtBase = True
@@ -2509,6 +3203,18 @@ class SceneParameters(object):
 			for label, cell in layout.victim_cells.items()
 		}
 		self.mazeHazardCells = [tuple(cell) for cell in layout.hazard_cells]
+		self.doorwayPassage = (
+			None if layout.doorway_passage is None
+			else tuple(tuple(cell) for cell in layout.doorway_passage)
+		)
+		self.doorwaySegment = (
+			None if self.doorwayPassage is None
+			else tuple(tuple(point) for point in passage_grid_segment(self.doorwayPassage))
+		)
+		self.rubbleFloorPlacements = [
+			(tuple(cell), str(side).upper())
+			for cell, side in layout.rubble_floor_placements
+		]
 		self.activeMazeLayout = layout
 		self._activeMazeMode = layout.mode
 
@@ -2526,6 +3232,10 @@ class SceneParameters(object):
 				f"(got {self.mazeGenerationMode!r})")
 		self.mazeGenerationMode = mode
 		victimCount = validate_victim_count(self.numberOfVictims)
+		rubbleFloorTileCount = validate_rubble_floor_tile_count(
+			self.numberOfRubbleFloorTiles)
+		if not isinstance(self.generateDoorway, bool):
+			raise ValueError('generateDoorway must be True or False')
 
 		if mode == 'random':
 			if force_random or self._activeMazeMode != 'random':
@@ -2537,6 +3247,8 @@ class SceneParameters(object):
 					seed=self.randomMazeSeed,
 					maximum_attempts=self.randomMazeMaximumAttempts,
 					victim_count=victimCount,
+					include_doorway=self.generateDoorway,
+					rubble_floor_tile_count=rubbleFloorTileCount,
 				)
 				# Face the robot through the base's sole opening. This also keeps the
 				# navigation system's initial cardinal direction consistent with the maze.
@@ -2570,12 +3282,38 @@ class SceneParameters(object):
 			label: self.presetVictimCells[label]
 			for label in VICTIM_LEVELS[:victimCount]
 		}
+		doorwayPassage = None
+		if self.generateDoorway:
+			adjacency = build_open_adjacency(
+				self.mazeRows, self.mazeColumns, wallSegments)
+			doorwayPassage = select_straight_corridor_passage(adjacency)
+			if doorwayPassage is None:
+				raise ValueError(
+					'Configured preset maze has no suitable two-cell straight corridor '
+					'for the doorway')
+		adjacency = build_open_adjacency(
+			self.mazeRows, self.mazeColumns, wallSegments)
+		rubbleFloorPlacements = select_rubble_floor_placements(
+			adjacency,
+			self.mazeRows,
+			self.mazeColumns,
+			baseCell,
+			victimCells.values(),
+			rubbleFloorTileCount,
+			excluded_cells=doorwayPassage or (),
+		)
+		if rubbleFloorPlacements is None:
+			raise ValueError(
+				'Configured preset maze has no suitable traversable cells for '
+				'rubble floor tiles')
 		layout = MazeLayout(
 			rows=self.mazeRows,
 			columns=self.mazeColumns,
 			wall_segments=list(wallSegments),
 			base_cell=tuple(baseCell),
 			victim_cells=dict(victimCells),
+			doorway_passage=doorwayPassage,
+			rubble_floor_placements=rubbleFloorPlacements,
 			mode='preset',
 		)
 		details = validate_maze_layout(layout)
@@ -2596,7 +3334,20 @@ class SceneParameters(object):
 			raise ValueError(f"mazeCellSize must be positive (got {self.mazeCellSize})")
 		if not math.isfinite(self.baseYaw):
 			raise ValueError(f"baseYaw must be finite (got {self.baseYaw})")
+		if not isinstance(self.generateDoorway, bool):
+			raise ValueError('generateDoorway must be True or False')
+		if (not math.isfinite(self.doorwayOpeningWidth) or
+				not 0.0 < self.doorwayOpeningWidth < self.mazeCellSize):
+			raise ValueError(
+				'doorwayOpeningWidth must be positive, finite, and smaller than mazeCellSize')
 		victimCount = validate_victim_count(self.numberOfVictims)
+		rubbleFloorTileCount = validate_rubble_floor_tile_count(
+			self.numberOfRubbleFloorTiles)
+		if len(self.rubbleFloorPlacements) != rubbleFloorTileCount:
+			raise ValueError(
+				f'numberOfRubbleFloorTiles={rubbleFloorTileCount} requires exactly '
+				f'{rubbleFloorTileCount} rubbleFloorPlacements; call '
+				'prepare_maze_layout() before validation')
 		expectedVictimLabels = set(VICTIM_LEVELS[:victimCount])
 		if set(self.victimCells) != expectedVictimLabels:
 			raise ValueError(
@@ -2609,6 +3360,9 @@ class SceneParameters(object):
 			wall_segments=list(self.mazeWallSegments),
 			base_cell=tuple(self.baseCell),
 			victim_cells=dict(self.victimCells),
+			doorway_passage=(
+				self.doorwayPassage if self.generateDoorway else None),
+			rubble_floor_placements=list(self.rubbleFloorPlacements),
 			mode=str(self.mazeGenerationMode).strip().lower(),
 			seed=self.activeMazeSeed,
 			generation_attempt=self.mazeGenerationAttempt,
@@ -2618,11 +3372,11 @@ class SceneParameters(object):
 		layout.hazard_cells = details['hazard_cells']
 		self.mazeVictimDistances = dict(details['victim_distances'])
 		self.mazeHazardCells = list(details['hazard_cells'])
+		self.doorwaySegment = details['doorway_segment']
+		self.rubbleFloorPlacements = list(details['rubble_floor_placements'])
 		self.activeMazeLayout = layout
 		return details
 
 
 # Earlier class name retained so existing staff solutions continue to run.
 COPPELIA_MazeRobot = MazeBot
-
-

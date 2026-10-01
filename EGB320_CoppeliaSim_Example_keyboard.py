@@ -12,7 +12,7 @@ import time
 
 from keyboard_control import KeyboardController, clear_console
 from mazebot_lib import MazeBot, RobotParameters, SceneParameters
-
+from EGB320_Milestone2_Mazes import apply_milestone2_preset
 
 FORWARD_SPEED = 0.03  # m/s
 TURN_SPEED = 0.30     # rad/s
@@ -36,7 +36,9 @@ def collect_or_release(robot):
     return 'No victim is close enough to collect.'
 
 
-def show_status(command, walls, encoders, odometry, detections, collection_status):
+def show_status(
+        command, walls, encoders, odometry, detections, doorway_edges,
+        collection_status):
     """Display the latest commands and sensor readings in the terminal."""
     clear_console()
     print('EGB320 MazeBot keyboard control')
@@ -61,6 +63,7 @@ def show_status(command, walls, encoders, odometry, detections, collection_statu
     if detections is None:
         print('wall markers: detection camera disabled')
         print('yellow victim: detection camera disabled')
+        print('orange rubble obstacle: detection camera disabled')
     else:
         visible_markers = [
             name for name in ('base', 'victim', 'rubble_victim', 'hazard')
@@ -76,8 +79,31 @@ def show_status(command, walls, encoders, odometry, detections, collection_statu
         else:
             print('yellow victim: none')
 
+        if detections['rubble_obstacle']:
+            range_m, bearing_rad = detections['rubble_obstacle'][0]
+            print(
+                f'orange rubble obstacle: {range_m:.3f} m, '
+                f'{math.degrees(bearing_rad):.1f} degrees')
+        else:
+            print('orange rubble obstacle: none')
+
+    visible_doorway_edges = []
+    for side in ('left', 'right'):
+        if doorway_edges[side]:
+            range_m, bearing_rad = doorway_edges[side]
+            visible_doorway_edges.append(
+                f'{side}={range_m:.3f} m/'
+                f'{math.degrees(bearing_rad):+.1f} degrees')
+    if visible_doorway_edges:
+        print('doorway inner edges:', ', '.join(visible_doorway_edges))
+    else:
+        print('doorway inner edges: not visible')
+
     print('collection:', collection_status)
 
+
+# ip_address = '131.181.249.69'  # CoppeliaSim server IP address
+ip_address = 'localhost'  # CoppeliaSim server IP address
 
 def main():
     # Only settings that differ from the defaults need to be specified.
@@ -86,16 +112,24 @@ def main():
     parameters.cameraTilt = -0.1
     # Choose 'legacy' (stable default) or 'opengl3' for the ObjectDetector renderer.
     parameters.objectDetectorRenderer = 'legacy'
+    parameters.objectDetectorPerspectiveAngle = math.radians(60.0)
+    parameters.objectDetectorResolutionX = 64
+    parameters.objectDetectorResolutionY = 64
 
     # A small set of scene options students can safely change.
     scene_parameters = SceneParameters()
-    scene_parameters.numberOfVictims = 1       # 1=L1, 2=L1/L2, 3=all victims
+    scene_parameters.numberOfVictims = 3       # 1=L1, 2=L1/L2, 3=all victims
+    scene_parameters.numberOfRubbleFloorTiles = 2  # valid: 1 or 2
     scene_parameters.mazeGenerationMode = 'random'  # 'preset' or 'random'
-    scene_parameters.randomMazeSeed = 1000      # integer = repeatable random maze
+    scene_parameters.randomMazeSeed = None      # integer = repeatable random maze
+    scene_parameters.generateDoorway = True
     # scene_parameters.randomMazeSeed = None    # None = new maze each start
 
+    # apply_milestone2_preset(scene_parameters, maze_number=1)  # 1 or 2
+
     # Connect to the supplied scene and generate the configured maze.
-    robot = MazeBot(parameters, scene_parameters)
+    robot = MazeBot(parameters, scene_parameters, coppelia_server_ip=ip_address)
+    
     keyboard = KeyboardController()
     robot.StartSimulator()
 
@@ -136,6 +170,7 @@ def main():
                 # GetDetections() line until you need marker or victim detections.
                 detections = None
                 detections = robot.GetDetections()
+                doorway_edges = robot.GetDoorwayEdges()
 
                 # OPTIONAL: Read the full colour image from the VisionSensor camera.
                 # This is slower than GetDetections(), so only use it when needed.
@@ -145,7 +180,8 @@ def main():
                 # For an autonomous program, replace the keyboard-command section above
                 # with code that uses `walls` and `detections` to choose velocities.
                 show_status(
-                    command, walls, encoders, odometry, detections, collection_status)
+                    command, walls, encoders, odometry, detections,
+                    doorway_edges, collection_status)
                 next_display_time = current_time + DISPLAY_PERIOD
 
             time.sleep(0.01)

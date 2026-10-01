@@ -159,8 +159,8 @@ end
 local function detectObjectColours(sensorHandle)
     -- Packet order (also used by mazeObjects in mazebot_lib.py): obstacle 0,
     -- obstacle 1, obstacle 2, base marker, victim marker, rubble-victim marker,
-    -- hazard marker, victim object.
-    local detections = {0, 0, 0, 0, 0, 0, 0, 0}
+    -- hazard marker, victim object, orange rubble-floor obstacle.
+    local detections = {0, 0, 0, 0, 0, 0, 0, 0, 0}
 
     simVision.sensorImgToWorkImg(sensorHandle)
     simVision.workImgToBuffer1(sensorHandle)
@@ -186,7 +186,9 @@ local function detectObjectColours(sensorHandle)
     detections[6] = detectColor({1.00, 0.00, 1.00}, {0.60, 0.12, 0.60}) and 1 or 0
     detections[7] = detectColor({1.00, 0.00, 0.00}, {0.60, 0.12, 0.12}) and 1 or 0
     detections[8] = detectColor(
-        {1.00, 1.00, 0.00}, {0.60, 0.60, 0.12}, 0.002) and 1 or 0
+        {1.00, 1.00, 0.00}, {0.60, 0.30, 0.12}, 0.002) and 1 or 0
+    detections[9] = detectColor(
+        {1.00, 0.50, 0.00}, {0.60, 0.35, 0.12}, 0.002) and 1 or 0
 
     -- Leave the sensor image showing the original RGB render rather than the last mask.
     simVision.buffer1ToWorkImg(sensorHandle)
