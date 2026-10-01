@@ -12,7 +12,6 @@ import time
 
 from keyboard_control import KeyboardController, clear_console
 from mazebot_lib import MazeBot, RobotParameters, SceneParameters
-from EGB320_Milestone2_Mazes import apply_milestone2_preset
 
 FORWARD_SPEED = 0.03  # m/s
 TURN_SPEED = 0.30     # rad/s
